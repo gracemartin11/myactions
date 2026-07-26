@@ -1,0 +1,138 @@
+name: Bluesky Auto Poster
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      account_row:
+        description: >
+          OPTIONAL. Leave blank to auto-run every eligible account row from
+          the sheet (up to MAX_ACCOUNTS_PER_RUN, if set — see below). Fill
+          in a single row number to force this run onto just that one row,
+          skipping the eligibility filter and the cap. All other settings
+          (ratios, hashtags, links, caption toggle, report frequency, etc.)
+          live in Sheet1/Settings and are re-read every posting cycle.
+        required: false
+        default: ""
+      max_accounts:
+        description: >
+          OPTIONAL. Overrides the Settings-tab MAX_ACCOUNTS_PER_RUN cap for
+          this run only. Leave blank to use the sheet's own setting (or
+          run every eligible account if that's blank too).
+        required: false
+        default: ""
+
+concurrency:
+  group: bluesky-poster
+  cancel-in-progress: false
+
+jobs:
+  # ── Step 1: figure out which account rows run this time ──────────────────
+  # Reads Sheet1, drops empty/banned/suspended rows, applies the optional
+  # cap, and hands the resulting row list to the 'post' job below as a
+  # matrix — so every eligible account gets its own parallel job in THIS
+  # workflow run, instead of one account per scheduled run.
+  discover-accounts:
+    runs-on: ubuntu-latest
+    outputs:
+      rows:  ${{ steps.discover.outputs.rows }}
+      count: ${{ steps.discover.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      # postnow_status_post.py imports bs4/atproto/PIL/requests at module
+      # level, so even --discover mode needs the full dependency set
+      # installed, not just the Google libs.
+      - name: Install dependencies
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
+
+      # Credentials are written straight from the secret — never fetched
+      # from a public URL, never committed to the repo.
+      - name: Write Google service-account credentials
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > google_creds.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+      # NOTE: discover_accounts.py was merged into postnow_status_post.py
+      # (invoked via the --discover flag) so there's only one script in
+      # the repo. This step now calls that instead of a separate file.
+      - name: Discover eligible accounts
+        id: discover
+        run: python -u postnow_status_post.py --discover
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
+          FORCE_ACCOUNT_ROW: ${{ github.event.inputs.account_row }}
+          MAX_ACCOUNTS_PER_RUN: ${{ github.event.inputs.max_accounts }}
+
+      - name: Clean up credentials file
+        if: always()
+        run: rm -f google_creds.json
+
+  # ── Step 2: one job per eligible account, run in parallel ────────────────
+  post:
+    needs: discover-accounts
+    if: needs.discover-accounts.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false          # one account failing shouldn't cancel the rest
+      matrix:
+        # 'rows' is a plain comma-separated string like "1,2,3,4" (see the
+        # NOTE in postnow_status_post.py's run_discover() for why this
+        # isn't emitted as JSON directly). We rebuild the JSON array here.
+        account_row: ${{ fromJson(format('[{0}]', needs.discover-accounts.outputs.rows)) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      # Mega login now comes straight from a secret holding the full
+      # rclone.conf [mega] section — nothing is fetched from a public page.
+      - name: Write rclone config (Mega)
+        run: echo "$MEGA_RCLONE_CONF" > rclone.conf
+        env:
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
+
+      - name: Write Google service-account credentials
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > google_creds.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Run poster loop for this account
+        run: python -u postnow_status_post.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
+          GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          # POST_PLAN_SHEET_ID / LINK_PLAN_SHEET_ID: optional secrets, only
+          # needed if the post-plan / link-plan live in a different sheet
+          # than GOOGLE_SHEET_ID — uncomment to use them:
+          # POST_PLAN_SHEET_ID: ${{ secrets.POST_PLAN_SHEET_ID }}
+          # LINK_PLAN_SHEET_ID: ${{ secrets.LINK_PLAN_SHEET_ID }}
+          ACCOUNT_ROW: ${{ matrix.account_row }}
+
+      - name: Clean up credentials
+        if: always()
+        run: rm -f rclone.conf google_creds.json
+
+      # NOTE: this workflow used to self-disable on any account failure.
+      # That made sense back when one workflow == one account; now that a
+      # single run can cover many accounts, a self-disable step here would
+      # take every account offline because one of them got banned. Instead,
+      # postnow_status_post.py already writes ACCOUNT_STATUS on the sheet
+      # row when an account is banned/suspended/auth-fails, and
+      # run_discover() (via --discover) automatically excludes that row
+      # from future runs. No workflow-level disable needed.
