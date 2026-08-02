@@ -8,18 +8,15 @@ on:
       account_row:
         description: >
           OPTIONAL. Leave blank to auto-run every eligible account row from
-          the sheet (up to MAX_ACCOUNTS_PER_RUN, if set — see below). Fill
-          in a single row number to force this run onto just that one row,
-          skipping the eligibility filter and the cap. All other settings
-          (ratios, hashtags, links, caption toggle, report frequency, etc.)
-          live in Sheet1/Settings and are re-read every posting cycle.
+          the Credentials sheet (up to MAX_ACCOUNTS_PER_RUN, if set). Fill in
+          a single row number to force this run onto just that one row.
         required: false
         default: ""
       max_accounts:
         description: >
-          OPTIONAL. Overrides the Settings-tab MAX_ACCOUNTS_PER_RUN cap for
-          this run only. Leave blank to use the sheet's own setting (or
-          run every eligible account if that's blank too).
+          OPTIONAL. Overrides the Settings-sheet MAX_ACCOUNTS_PER_RUN cap for
+          this run only. Leave blank to use the sheet setting (or run every
+          eligible account if that's blank too).
         required: false
         default: ""
 
@@ -29,10 +26,6 @@ concurrency:
 
 jobs:
   # ── Step 1: figure out which account rows run this time ──────────────────
-  # Reads Sheet1, drops empty/banned/suspended rows, applies the optional
-  # cap, and hands the resulting row list to the 'post' job below as a
-  # matrix — so every eligible account gets its own parallel job in THIS
-  # workflow run, instead of one account per scheduled run.
   discover-accounts:
     runs-on: ubuntu-latest
     outputs:
@@ -43,36 +36,50 @@ jobs:
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-      # postnow_status_post.py imports bs4/atproto/PIL/requests at module
-      # level, so even --discover mode needs the full dependency set
-      # installed, not just the Google libs.
-      - name: Install dependencies
-        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
 
-      # Credentials are written straight from the secret — never fetched
-      # from a public URL, never committed to the repo.
+      # google-api-python-client + google-auth talk to Sheets; the rest are
+      # imported at module level by postnow_status_post.py even in
+      # --discover mode, so install the full set here too.
+      - name: Install dependencies
+        run: |
+          pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4
+
+      - name: Install rclone (media lives on Mega)
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Write rclone config (Mega — media only)
+        run: echo "$MEGA_RCLONE_CONF" > rclone.conf
+        env:
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
+
+      # Written straight from the secret — never fetched from a public URL,
+      # never committed to the repo.
       - name: Write Google service-account credentials
         run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > google_creds.json
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-      # NOTE: discover_accounts.py was merged into postnow_status_post.py
-      # (invoked via the --discover flag) so there's only one script in
-      # the repo. This step now calls that instead of a separate file.
       - name: Discover eligible accounts
         id: discover
         run: python -u postnow_status_post.py --discover
         env:
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
           FORCE_ACCOUNT_ROW: ${{ github.event.inputs.account_row }}
           MAX_ACCOUNTS_PER_RUN: ${{ github.event.inputs.max_accounts }}
+          # Sheets quota tuning — see comments at the top of the script.
+          SHEETS_RETRY_BUDGET_SECONDS: "240"
+          SHEETS_MAX_BACKOFF_SECONDS: "60"
 
-      - name: Clean up credentials file
+      - name: Clean up credentials
         if: always()
-        run: rm -f google_creds.json
+        run: rm -f rclone.conf google_creds.json
 
-  # ── Step 2: one job per eligible account, run in parallel ────────────────
+  # ── Step 2: one job per eligible account, run in parallel (throttled) ────
   post:
     needs: discover-accounts
     if: needs.discover-accounts.outputs.count != '0'
@@ -80,6 +87,13 @@ jobs:
     timeout-minutes: 355
     strategy:
       fail-fast: false          # one account failing shouldn't cancel the rest
+      # THROTTLE: only this many account jobs hit the Sheets API at once.
+      # With 10+ accounts firing every cycle, running them all fully in
+      # parallel is exactly what blows through the per-minute quota. 4 is a
+      # safe default — raise it if your Google Cloud project's Sheets API
+      # quota (Google Cloud Console → APIs & Services → Sheets API → Quotas)
+      # is higher, lower it if you're still seeing 429s.
+      max-parallel: 4
       matrix:
         # 'rows' is a plain comma-separated string like "1,2,3,4" (see the
         # NOTE in postnow_status_post.py's run_discover() for why this
@@ -91,15 +105,14 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
+        run: |
+          pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
           rclone version
 
-      # Mega login now comes straight from a secret holding the full
-      # rclone.conf [mega] section — nothing is fetched from a public page.
-      - name: Write rclone config (Mega)
+      - name: Write rclone config (Mega — media only)
         run: echo "$MEGA_RCLONE_CONF" > rclone.conf
         env:
           MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
@@ -115,24 +128,29 @@ jobs:
           PYTHONUNBUFFERED: "1"
           RCLONE_CONFIG_PATH: rclone.conf
           RCLONE_REMOTE_NAME: mega
-          GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          # POST_PLAN_SHEET_ID / LINK_PLAN_SHEET_ID: optional secrets, only
-          # needed if the post-plan / link-plan live in a different sheet
-          # than GOOGLE_SHEET_ID — uncomment to use them:
-          # POST_PLAN_SHEET_ID: ${{ secrets.POST_PLAN_SHEET_ID }}
-          # LINK_PLAN_SHEET_ID: ${{ secrets.LINK_PLAN_SHEET_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
           ACCOUNT_ROW: ${{ matrix.account_row }}
+          # ── Sheets quota tuning ──────────────────────────────────────
+          # How long (seconds) a single Sheets call keeps retrying through
+          # 429/quota errors before giving up on that one cycle. Since
+          # quota resets every minute, this mostly just needs to be a
+          # couple of minutes to ride out a burst.
+          SHEETS_RETRY_BUDGET_SECONDS: "240"
+          SHEETS_MAX_BACKOFF_SECONDS: "60"
+          # Random delay (0..N seconds) each job sleeps before its very
+          # first Sheets call, so a big matrix doesn't fire in the same
+          # instant. Increase if you still see bursts of 429s at start-up.
+          START_JITTER_MAX_SECONDS: "45"
+          # Small pause between consecutive Sheets calls within one job.
+          SHEETS_CALL_PACING_SECONDS: "0.3"
 
       - name: Clean up credentials
         if: always()
         run: rm -f rclone.conf google_creds.json
 
-      # NOTE: this workflow used to self-disable on any account failure.
-      # That made sense back when one workflow == one account; now that a
-      # single run can cover many accounts, a self-disable step here would
-      # take every account offline because one of them got banned. Instead,
-      # postnow_status_post.py already writes ACCOUNT_STATUS on the sheet
-      # row when an account is banned/suspended/auth-fails, and
-      # run_discover() (via --discover) automatically excludes that row
-      # from future runs. No workflow-level disable needed.
+      # postnow_status_post.py writes ACCOUNT_STATUS on the Credentials row
+      # when an account is banned/suspended/auth-fails, and run_discover()
+      # (via --discover) automatically excludes that row from future runs.
+      # No workflow-level disable needed — one bad account never takes the
+      # others offline.
