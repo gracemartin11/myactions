@@ -61,6 +61,20 @@ around minimizing call *count*, not just being polite about it:
      the retry budget is exhausted, `run_once()` raises, `main()`'s loop
      catches it, logs it, and sleeps until the next cycle. The account
      keeps trying every loop_interval instead of the job exiting.
+
+CALL-SITE CONVENTION FOR sheets_call()
+────────────────────────────────────────
+`sheets_call()` takes a zero-argument callable (`request_factory`) and
+calls `request_factory().execute()` on every attempt — never
+`request_factory(**kwargs)`. This matters for retries: if a network error
+triggers `_build_sheets_client()` mid-retry, a request object built once
+up front (e.g. a bound method reference captured before the loop) would
+still point at the OLD, now-dead client. Every call site below therefore
+wraps the actual Sheets API call in a `lambda: ...` so each retry
+attempt re-reads the (possibly just-rebuilt) global `_sheets` and
+re-evaluates the whole chain (including `.values()`) fresh, rather than
+passing kwargs into `sheets_call` itself for it to forward — `sheets_call`
+does not accept or forward extra kwargs.
 """
 import http.client
 import io
@@ -327,12 +341,16 @@ def sheets_call(request_factory, budget_seconds=None):
     point the caller (a cycle-level try/except in run_once/main) is
     expected to skip this cycle rather than crash the whole job.
 
-    `request_factory` is a zero-arg callable that BUILDS the request fresh
-    each attempt (e.g. `lambda: _sheets.values().get(...)`), rather than a
-    pre-bound method. This matters: if a network error triggers a client
-    rebuild mid-retry, a pre-bound method would still point at the old
-    (dead) client object. A factory re-reads the (possibly just-rebuilt)
-    global `_sheets` on every attempt."""
+    `request_factory` MUST be a zero-arg callable that BUILDS the request
+    fresh each attempt (e.g. `lambda: _sheets.values().get(spreadsheetId=...,
+    range=...)`), rather than a pre-bound method or a method reference with
+    kwargs tacked onto this call. This matters: if a network error triggers
+    a client rebuild mid-retry, a pre-bound method (or one captured before
+    the retry loop starts) would still point at the old (dead) client
+    object. A zero-arg lambda re-reads the (possibly just-rebuilt) global
+    `_sheets` on every attempt. `sheets_call` itself does not accept or
+    forward any Sheets API kwargs — all of that belongs inside the lambda
+    passed in by the caller."""
     budget = budget_seconds if budget_seconds is not None else SHEETS_RETRY_BUDGET_SECONDS
     start = time.time()
     attempt = 0
@@ -396,25 +414,28 @@ def col_letter(n):
 
 def sheets_get_batch(ranges):
     return sheets_call(
-        _sheets.values().batchGet,
-        spreadsheetId=GOOGLE_SHEET_ID, ranges=ranges,
-        valueRenderOption="UNFORMATTED_VALUE",
+        lambda: _sheets.values().batchGet(
+            spreadsheetId=GOOGLE_SHEET_ID, ranges=ranges,
+            valueRenderOption="UNFORMATTED_VALUE",
+        )
     )
 
 
 def sheets_get(rng):
     return sheets_call(
-        _sheets.values().get,
-        spreadsheetId=GOOGLE_SHEET_ID, range=rng,
-        valueRenderOption="UNFORMATTED_VALUE",
+        lambda: _sheets.values().get(
+            spreadsheetId=GOOGLE_SHEET_ID, range=rng,
+            valueRenderOption="UNFORMATTED_VALUE",
+        )
     )
 
 
 def sheets_update(rng, values):
     return sheets_call(
-        _sheets.values().update,
-        spreadsheetId=GOOGLE_SHEET_ID, range=rng,
-        valueInputOption="USER_ENTERED", body={"values": values},
+        lambda: _sheets.values().update(
+            spreadsheetId=GOOGLE_SHEET_ID, range=rng,
+            valueInputOption="USER_ENTERED", body={"values": values},
+        )
     )
 
 
@@ -425,23 +446,27 @@ def sheets_batch_update_values(data):
     if not data:
         return None
     return sheets_call(
-        _sheets.values().batchUpdate,
-        spreadsheetId=GOOGLE_SHEET_ID,
-        body={"valueInputOption": "USER_ENTERED", "data": data},
+        lambda: _sheets.values().batchUpdate(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": data},
+        )
     )
 
 
 def sheets_append(rng, values):
     return sheets_call(
-        _sheets.values().append,
-        spreadsheetId=GOOGLE_SHEET_ID, range=rng,
-        valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
-        body={"values": values},
+        lambda: _sheets.values().append(
+            spreadsheetId=GOOGLE_SHEET_ID, range=rng,
+            valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+            body={"values": values},
+        )
     )
 
 
 def sheets_existing_titles():
-    meta = sheets_call(_sheets.get, spreadsheetId=GOOGLE_SHEET_ID, fields="sheets.properties.title")
+    meta = sheets_call(
+        lambda: _sheets.get(spreadsheetId=GOOGLE_SHEET_ID, fields="sheets.properties.title")
+    )
     return {s["properties"]["title"] for s in meta.get("sheets", [])}
 
 
@@ -463,8 +488,11 @@ def ensure_required_tabs():
             add_requests.append({"addSheet": {"properties": {"title": tab}}})
             header_writes.append({"range": qrange(tab, "A1"), "values": [header]})
     if add_requests:
-        sheets_call(_sheets.batchUpdate, spreadsheetId=GOOGLE_SHEET_ID,
-                    body={"requests": add_requests})
+        sheets_call(
+            lambda: _sheets.batchUpdate(
+                spreadsheetId=GOOGLE_SHEET_ID, body={"requests": add_requests}
+            )
+        )
         print(f"Created missing tab(s): {[r['addSheet']['properties']['title'] for r in add_requests]}")
     if header_writes:
         sheets_batch_update_values(header_writes)
