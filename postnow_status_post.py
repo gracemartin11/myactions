@@ -259,7 +259,7 @@ START_JITTER_MAX_SECONDS        = get_int_env("START_JITTER_MAX_SECONDS", 45)
 # Small pause between consecutive Sheets calls from this one process, purely
 # to smooth out bursts (a cycle only makes a handful of calls, so this adds
 # at most ~1-2s of latency per cycle — cheap insurance against quota spikes).
-SHEETS_CALL_PACING_SECONDS      = get_float_env("SHEETS_CALL_PACING_SECONDS", "0.3")
+SHEETS_CALL_PACING_SECONDS      = _parse_plain_float(os.getenv("SHEETS_CALL_PACING_SECONDS"), 0.3)
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 _creds  = service_account.Credentials.from_service_account_file(
