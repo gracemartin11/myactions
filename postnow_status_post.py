@@ -62,12 +62,14 @@ around minimizing call *count*, not just being polite about it:
      catches it, logs it, and sleeps until the next cycle. The account
      keeps trying every loop_interval instead of the job exiting.
 """
+import http.client
 import io
 import json
 import os
 import random
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -265,8 +267,38 @@ _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 _creds  = service_account.Credentials.from_service_account_file(
     GOOGLE_APPLICATION_CREDENTIALS, scopes=_SCOPES
 )
-_service = build("sheets", "v4", credentials=_creds, cache_discovery=False)
-_sheets  = _service.spreadsheets()
+_service = None
+_sheets  = None
+
+
+def _build_sheets_client():
+    """(Re)build the googleapiclient service + spreadsheets() resource.
+    Called once at import, and again whenever a network-level error (as
+    opposed to a clean HTTP error response) suggests the underlying
+    connection is dead — e.g. after a long idle sleep between cycles, the
+    server or an intermediate NAT/load-balancer may have silently closed
+    the socket the client still thinks is usable, which surfaces as a raw
+    SSL/connection error rather than a normal HTTP 4xx/5xx."""
+    global _service, _sheets
+    _service = build("sheets", "v4", credentials=_creds, cache_discovery=False)
+    _sheets  = _service.spreadsheets()
+
+
+_build_sheets_client()
+
+# Exceptions that mean "the connection itself is broken", not "the server
+# gave us a proper HTTP error". These are typically what you get when a
+# long-idle keep-alive connection gets silently killed server-side or by a
+# NAT/firewall in between (very common after a 20-60 minute sleep()).
+_NETWORK_TRANSIENT_EXCEPTIONS = (
+    ssl.SSLError,
+    ConnectionError,           # covers ConnectionResetError, BrokenPipeError, etc.
+    http.client.HTTPException, # covers http.client.RemoteDisconnected, BadStatusLine, etc.
+    TimeoutError,
+    socket.timeout,
+    socket.error,
+    OSError,
+)
 
 
 def _is_quota_error(exc):
@@ -287,18 +319,26 @@ def _is_quota_error(exc):
     )
 
 
-def sheets_call(fn, *args, budget_seconds=None, **kwargs):
-    """Run any googleapiclient call with exponential backoff + jitter on
-    quota errors and transient 5xx. Retries for up to `budget_seconds`
-    (default SHEETS_RETRY_BUDGET_SECONDS) before giving up and re-raising —
-    at which point the caller (a cycle-level try/except in run_once/main)
-    is expected to skip this cycle rather than crash the whole job."""
+def sheets_call(request_factory, budget_seconds=None):
+    """Run a Sheets API request with exponential backoff + jitter on quota
+    errors, transient 5xx, AND raw network/SSL errors from dead/idle
+    connections. Retries for up to `budget_seconds` (default
+    SHEETS_RETRY_BUDGET_SECONDS) before giving up and re-raising — at which
+    point the caller (a cycle-level try/except in run_once/main) is
+    expected to skip this cycle rather than crash the whole job.
+
+    `request_factory` is a zero-arg callable that BUILDS the request fresh
+    each attempt (e.g. `lambda: _sheets.values().get(...)`), rather than a
+    pre-bound method. This matters: if a network error triggers a client
+    rebuild mid-retry, a pre-bound method would still point at the old
+    (dead) client object. A factory re-reads the (possibly just-rebuilt)
+    global `_sheets` on every attempt."""
     budget = budget_seconds if budget_seconds is not None else SHEETS_RETRY_BUDGET_SECONDS
     start = time.time()
     attempt = 0
     while True:
         try:
-            result = fn(*args, **kwargs).execute()
+            result = request_factory().execute()
             if SHEETS_CALL_PACING_SECONDS > 0:
                 time.sleep(SHEETS_CALL_PACING_SECONDS)
             return result
@@ -317,6 +357,25 @@ def sheets_call(fn, *args, budget_seconds=None, **kwargs):
             kind = "quota" if _is_quota_error(exc) else f"HTTP {status}"
             print(f"[sheets] {kind} error (attempt {attempt}, {elapsed:.0f}s elapsed) — "
                   f"retrying in {delay:.1f}s…")
+            time.sleep(delay)
+        except _NETWORK_TRANSIENT_EXCEPTIONS as exc:
+            attempt += 1
+            elapsed = time.time() - start
+            if elapsed > budget:
+                print(f"[sheets] giving up after {attempt} attempts / {elapsed:.0f}s "
+                      f"(still hitting network error: {exc!r}).")
+                raise
+            delay = min(SHEETS_MAX_BACKOFF_SECONDS, 2 * (2 ** (attempt - 1))) + random.uniform(0, 1.5)
+            print(f"[sheets] network/connection error (attempt {attempt}, {elapsed:.0f}s elapsed): "
+                  f"{exc!r} — rebuilding client and retrying in {delay:.1f}s…")
+            # The whole reason this happens is a stale/dead connection the
+            # client is still holding onto (usually after a long sleep()
+            # between cycles). Rebuilding gets a fresh connection instead
+            # of retrying against the same dead socket.
+            try:
+                _build_sheets_client()
+            except Exception as rebuild_exc:
+                print(f"[sheets] warning: failed to rebuild client ({rebuild_exc}); will retry anyway.")
             time.sleep(delay)
 
 
