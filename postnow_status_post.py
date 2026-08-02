@@ -1,3 +1,67 @@
+#!/usr/bin/env python3
+"""
+Bluesky auto-poster.
+
+Coordination data (Credentials / Settings / PostPlan / LinkPlan / Report)
+lives in a Google Sheet, read/written via the Sheets API v4. Media files
+(images/videos) still live on Mega, accessed via rclone — unchanged.
+
+WHY GOOGLE SHEETS DOESN'T NEED A WORKBOOK-WIDE LOCK
+────────────────────────────────────────────────────
+The old Mega-workbook version needed a real distributed lock because a
+".xlsx on Mega" has no per-cell API: every write meant "download the whole
+file, change it, upload the whole file back", so two runners touching it at
+once could corrupt each other's changes.
+
+The Sheets API has no such problem — `values.update` / `values.batchUpdate`
+write to specific cells/rows without touching anything else, and Google
+serializes concurrent writes to the same cell for you. So this version
+drops the whole-workbook lock entirely. What's left is the same *business*
+locks it always had:
+  - a soft, TTL-based "which repo currently owns this account row" lock
+    (LOCKED_BY / LOCKED_AT columns) — unchanged in spirit from before.
+  - "claim" columns on PostPlan/LinkPlan rows so two runners don't post the
+    same row twice — same read-then-write pattern as before.
+Both are optimistic (read-fresh, then write) rather than hard locks, which
+is an acceptable trade-off for a per-account content queue, and it's how
+LinkPlan claiming already worked even in the Mega version.
+
+QUOTA / RATE-LIMIT DESIGN
+────────────────────────────
+Google Sheets API default quotas are per-minute, per-project *and*
+per-user (the same service account = the same "user" across every parallel
+matrix job). Running 10+ accounts at once, each doing lots of small
+reads/writes, is exactly how you blow through that. This file is built
+around minimizing call *count*, not just being polite about it:
+
+  1. BATCH READS: Credentials + Settings + Report are fetched together in
+     ONE `values.batchGet` call per cycle (multiple ranges in one HTTP
+     request only counts once against quota). PostPlan/LinkPlan are then
+     fetched together in a second batchGet once we know their tab names
+     from Settings. That's ~2 read calls per account per cycle, full stop.
+
+  2. BATCH WRITES: related cell updates (e.g. LOCKED_BY + LOCKED_AT, or
+     ASSIGNED_REPO + ASSIGNED_STATUS + ASSIGNED_AT) go out together via
+     `values.batchUpdate` instead of one call per cell.
+
+  3. RETRY WITH BACKOFF: every Sheets call is wrapped in `sheets_call()`,
+     which catches 429 / RESOURCE_EXHAUSTED / rateLimitExceeded / transient
+     5xx errors and retries with exponential backoff + jitter (capped at
+     60s per wait, up to SHEETS_RETRY_BUDGET_SECONDS total). Since Google's
+     quota window is per-minute, a short backoff loop is usually enough to
+     just wait for the next window rather than treating it as a hard
+     failure.
+
+  4. STARTUP JITTER: each parallel account job sleeps a random amount
+     (0..START_JITTER_MAX_SECONDS) before its very first Sheets call, so a
+     10-account matrix doesn't fire 10 simultaneous bursts in the same
+     second right when the workflow starts.
+
+  5. NEVER GIVE UP ON THE SCHEDULE: if a cycle still can't get through after
+     the retry budget is exhausted, `run_once()` raises, `main()`'s loop
+     catches it, logs it, and sleeps until the next cycle. The account
+     keeps trying every loop_interval instead of the job exiting.
+"""
 import io
 import json
 import os
@@ -8,25 +72,23 @@ import subprocess
 import sys
 import time
 import uuid
-import requests
+from datetime import datetime
 from urllib.parse import urljoin
+
+import requests
 from bs4 import BeautifulSoup
-from googleapiclient.discovery import build
-from google.oauth2.service_account import Credentials
 from atproto import Client, models
 from atproto_client.utils import TextBuilder
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 RUN_TAG      = os.getenv("GITHUB_RUN_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 CLAIM_PREFIX = "CLAIMED_"
 
-# Identity of the repo/runner executing this job right now — used for:
-#   (a) the soft cross-repo posting lock (LOCKED_BY / LOCKED_AT columns)
-#   (b) the *permanent* account-row assignment (ASSIGNED_REPO / ASSIGNED_STATUS
-#       columns) — see resolve_account_row() below.
 CURRENT_REPO     = os.getenv("GITHUB_REPOSITORY") or f"local-{socket.gethostname()}"
-LOCK_TTL_MINUTES = 45  # longer than the internal post loop, so an actively
-                        # running job keeps refreshing its own lock
-
+LOCK_TTL_MINUTES = 45   # business-level "which repo owns this account row" heartbeat TTL
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ENV / VALUE PARSING HELPERS
@@ -46,7 +108,6 @@ def _parse_bool(raw, default=False):
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 def _parse_pct(raw, default):
-    """Parses values meant as a share/percentage, e.g. '60' -> 0.60, '0.6' -> 0.6."""
     if raw is None or not str(raw).strip():
         return default
     raw = str(raw).strip().rstrip("%")
@@ -86,66 +147,59 @@ def get_int_env(name, default):
 #  STATIC WORKFLOW KNOBS
 # ═══════════════════════════════════════════════════════════════════════════
 
-ACCOUNT_ROW = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 0)
+ACCOUNT_ROW = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 1 in the sheet)
 
-# ── rclone / Mega ────────────────────────────────────────────────────────────
-# rclone.conf itself is now written by the workflow from the MEGA_RCLONE_CONF
-# secret — nothing Mega-related is hardcoded or fetched from a public URL here.
 RCLONE_CONFIG_PATH = get_env("RCLONE_CONFIG_PATH", required=False) or "rclone.conf"
 RCLONE_REMOTE_NAME = get_env("RCLONE_REMOTE_NAME", required=False) or "mega"
 
-SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+CREDS_TAB    = "Credentials"
+SETTINGS_TAB = "Settings"
+REPORT_TAB   = "Report"
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SPREADSHEETS
-# ═══════════════════════════════════════════════════════════════════════════
-#
-#  All spreadsheet IDs now come from env vars (set by the workflow from
-#  repo/org secrets) instead of being hardcoded in source — nothing here
-#  reveals which Google Sheet this points at.
-#
-#  Required:  GOOGLE_SHEET_ID          (master sheet: Credentials/Settings/Report)
-#  Optional:  POST_PLAN_SHEET_ID       (defaults to GOOGLE_SHEET_ID)
-#             LINK_PLAN_SHEET_ID       (defaults to POST_PLAN_SHEET_ID)
-
-# Master sheet: Sheet1 = per-account credentials, Settings = shared live
-# knobs (image/video/previewLink ratio, hashtags, link, caption toggle,
-# report freq, etc.), Report = simplified one-row-per-check-in report.
-MASTER_SHEET_ID = get_env("GOOGLE_SHEET_ID")
-CREDS_TAB       = "Credentials"
-SETTINGS_TAB    = "Settings"
-REPORT_TAB      = "Report"
-
-# Any ACCOUNT_STATUS value containing one of these (case-insensitive) is
-# excluded from discovery — matches the status strings this same script
-# writes on a fatal account error (see _write_account_status()).
 SKIP_STATUS_MARKERS = ("banned", "suspended", "taken down", "auth failed")
 
-# Simplified 7-column report header — one row per report check-in, not one
-# row per followers-count plus N more rows per top post.
 REPORT_HEADER = ["Timestamp (UTC)", "Handle", "Followers", "Gained", "Top Post", "Engagement", "Status"]
 
-# Post-plan sheet (separate spreadsheet) — File Name + Caption + Status,
-# used for the "image" and "video" post types (Mega-hosted media). Falls
-# back to the master sheet ID if a dedicated one isn't set, so a single
-# GOOGLE_SHEET_ID secret is enough for a one-spreadsheet setup.
-POST_PLAN_SHEET_ID  = get_env("POST_PLAN_SHEET_ID", required=False) or MASTER_SHEET_ID
+CREDENTIALS_HEADER = [
+    "BSKY_HANDLE", "BSKY_APP_PW", "HASHTAGS",
+    "MEGA_UPLOAD_FOLDER", "MEGA_PROCESSED_FOLDER",
+    "LINK_URL", "LINK_DISPLAY_TEXT",
+    "LOCKED_BY", "LOCKED_AT",
+    "ACCOUNT_STATUS", "ACCOUNT_STATUS_AT",
+    "ASSIGNED_REPO", "ASSIGNED_STATUS", "ASSIGNED_AT",
+]
+
+DEFAULT_SETTINGS = [
+    ("IMAGE_RATIO", "0.60"),
+    ("VIDEO_RATIO", "0.40"),
+    ("LINK_RATIO", "0.0"),
+    ("HASHTAGS_ENABLED_IMAGE", "true"),
+    ("HASHTAGS_ENABLED_VIDEO", "false"),
+    ("HASHTAGS_ENABLED_LINK", "true"),
+    ("LINK_ENABLED_IMAGE", "true"),
+    ("LINK_ENABLED_VIDEO", "true"),
+    ("LINK_PERCENTAGE", "1.0"),
+    ("MAX_IMAGE_MB", "2.0"),
+    ("CAPTION_ENABLED", "true"),
+    ("AUTO_CAPTION_ENABLED_LINK", "true"),
+    ("PREVIEW_FETCH_TIMEOUT", "15"),
+    ("MAX_THUMB_MB", "1.0"),
+    ("ENABLE_REPORT", "false"),
+    ("REPORT_TIMES_PER_DAY", "1"),
+    ("TOP_POSTS_COUNT", "1"),
+    ("TOP_POSTS_WITHIN", "30"),
+    ("POST_PLAN_SHEET_NAME", "PostPlan"),
+    ("LINK_PLAN_SHEET_NAME", "LinkPlan"),
+    ("LOOP_INTERVAL_SECONDS", "1800"),
+    ("MAX_ACCOUNTS_PER_RUN", ""),
+]
+
 POSTED_STATUS_VALUE = "posted"
-
-# LinkPlan sheet — URL + Caption + Status, used for the "previewLink" post
-# type (social-card / link-preview posts, no media file needed). Lives as
-# a tab in the SAME spreadsheet as the post-plan by default — set
-# LINK_PLAN_SHEET_ID if you'd rather keep it separate.
-LINK_PLAN_SHEET_ID = get_env("LINK_PLAN_SHEET_ID", required=False) or POST_PLAN_SHEET_ID
-
 ASSIGN_STATUS_IN_USE = "In Use"
 
 _URL_RE     = re.compile(r"https?://\S+")
 _MENTION_RE = re.compile(r"@\S+")
 
-# Shared, browser-like headers used for the manual link-preview scrape
-# fallback and the thumbnail download.
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -157,214 +211,347 @@ REQUEST_HEADERS = {
 
 CARDYB_EXTRACT_URL = "https://cardyb.bsky.app/v1/extract"
 LINK_PREVIEW_MAX_RETRIES = 3
-LINK_PREVIEW_RETRY_DELAY = 2  # seconds; doubles each retry (2, 4, 8...)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  GOOGLE CREDENTIALS (service account — same one used by the Bluesky
-#  scraper and image scraper scripts. Needs Editor access on BOTH the
-#  master sheet and the post-plan/link-plan sheet.)
-#
-#  The credentials JSON itself is written to disk by the workflow from the
-#  GOOGLE_SERVICE_ACCOUNT_JSON secret before this script runs — this file
-#  never fetches it from anywhere.
-# ═══════════════════════════════════════════════════════════════════════════
-
-def get_sheets_service():
-    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "google_creds.json")
-    if not os.path.exists(creds_path):
-        raise RuntimeError(f"Google credentials file not found at {creds_path}")
-    creds = Credentials.from_service_account_file(creds_path, scopes=SHEETS_SCOPES)
-    return build("sheets", "v4", credentials=creds)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SHEET CELL HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _col_letter(idx0):
-    idx, letters = idx0 + 1, ""
-    while idx > 0:
-        idx, rem = divmod(idx - 1, 26)
-        letters  = chr(65 + rem) + letters
-    return letters
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  AUTO ACCOUNT-ROW ASSIGNMENT (unchanged)
-# ═══════════════════════════════════════════════════════════════════════════
-
-CREDS_RANGE = f"{CREDS_TAB}!A:Z"
-
-def resolve_account_row():
-    explicit = get_env("ACCOUNT_ROW", required=False)
-    if explicit:
-        row = _parse_int(explicit, 1)
-        print(f"ACCOUNT_ROW={row} was explicitly set — using it as a manual override "
-              f"(auto-assignment skipped).")
-        return row
-
-    service = get_sheets_service()
-    values  = service.spreadsheets().values().get(
-        spreadsheetId=MASTER_SHEET_ID, range=CREDS_RANGE
-    ).execute().get("values", [])
-
-    if len(values) < 2:
-        raise RuntimeError(f"'{CREDS_TAB}' has no data rows to auto-assign.")
-
-    header = [h.strip().upper() for h in values[0]]
-
-    def hidx(*names):
-        for n in names:
-            if n in header:
-                return header.index(n)
-        return None
-
-    handle_idx = hidx("BSKY_HANDLE")
-    repo_idx   = hidx("ASSIGNED_REPO")
-    status_idx = hidx("ASSIGNED_STATUS")
-    at_idx     = hidx("ASSIGNED_AT")
-
-    if handle_idx is None or repo_idx is None or status_idx is None:
-        raise RuntimeError(
-            f"Auto row-assignment needs 'BSKY_HANDLE', 'ASSIGNED_REPO' and "
-            f"'ASSIGNED_STATUS' columns in '{CREDS_TAB}' (optionally "
-            f"'ASSIGNED_AT' too). Add any missing ones to the header row, or "
-            f"set ACCOUNT_ROW manually for this run."
-        )
-
-    def cell(row, idx):
-        return row[idx].strip() if idx is not None and len(row) > idx else ""
-
-    for i, row in enumerate(values[1:], start=1):
-        if cell(row, repo_idx) == CURRENT_REPO:
-            print(f"Repo '{CURRENT_REPO}' already owns Sheet1 row {i} "
-                  f"({cell(row, handle_idx) or 'no handle'}) — reusing it.")
-            return i
-
-    for i, row in enumerate(values[1:], start=1):
-        handle_val = cell(row, handle_idx)
-        status_val = cell(row, status_idx)
-        if not handle_val:
-            continue
-        if status_val.lower() == ASSIGN_STATUS_IN_USE.lower():
-            continue
-        _claim_account_row(service, i, repo_idx, status_idx, at_idx)
-        print(f"Claimed Sheet1 row {i} ({handle_val}) for repo '{CURRENT_REPO}'.")
-        return i
-
-    raise RuntimeError(
-        f"No available account rows left in '{CREDS_TAB}' — every configured "
-        f"row is already marked '{ASSIGN_STATUS_IN_USE}'. Add a new account "
-        f"row, or clear ASSIGNED_REPO/ASSIGNED_STATUS on one you want to free up."
-    )
-
-
-def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
-    sheet_row = data_idx + 1
-    now       = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    data = [
-        {"range": f"{CREDS_TAB}!{_col_letter(repo_idx)}{sheet_row}",   "values": [[CURRENT_REPO]]},
-        {"range": f"{CREDS_TAB}!{_col_letter(status_idx)}{sheet_row}", "values": [[ASSIGN_STATUS_IN_USE]]},
-    ]
-    if at_idx is not None:
-        data.append({"range": f"{CREDS_TAB}!{_col_letter(at_idx)}{sheet_row}", "values": [[now]]})
-
-    service.spreadsheets().values().batchUpdate(
-        spreadsheetId=MASTER_SHEET_ID,
-        body={"valueInputOption": "RAW", "data": data},
-    ).execute()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  ACCOUNT CONFIG + LIVE SETTINGS — from Sheet1, row ACCOUNT_ROW.
-# ═══════════════════════════════════════════════════════════════════════════
-
-_account_config         = None
-_creds_lock_col_by      = None
-_creds_lock_col_at      = None
-_creds_status_col       = None
-_creds_status_at_col    = None
-_global_settings_cache  = None
+LINK_PREVIEW_RETRY_DELAY = 2
 
 DEFAULT_LOOP_INTERVAL_SECONDS = 1800
 
 
-def load_global_settings(force_refresh=False):
-    global _global_settings_cache
-    if _global_settings_cache is not None and not force_refresh:
-        return _global_settings_cache
+# ═══════════════════════════════════════════════════════════════════════════
+#  RCLONE HELPERS (media files only — images/videos on Mega, unchanged)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _rclone_run(args, timeout=120):
+    return subprocess.run(
+        ["rclone", "--config", RCLONE_CONFIG_PATH] + args,
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+def rclone_list_files(remote_folder):
+    result = _rclone_run(["lsf", remote_folder, "--files-only"])
+    if result.returncode != 0:
+        print(f"Warning: rclone lsf failed for '{remote_folder}': {result.stderr.strip()[-300:]}")
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+def rclone_claim(remote_folder, name):
+    claimed_name = f"{CLAIM_PREFIX}{RUN_TAG}__{name}"
+    result = _rclone_run(["moveto", f"{remote_folder}/{name}", f"{remote_folder}/{claimed_name}"])
+    return claimed_name if result.returncode == 0 else None
+
+def rclone_download(remote_folder, filename, local_path, timeout=120):
+    result = _rclone_run(["copyto", f"{remote_folder}/{filename}", local_path], timeout=timeout)
+    return result.returncode == 0
+
+def rclone_move(src, dst, timeout=120):
+    result = _rclone_run(["moveto", src, dst], timeout=timeout)
+    return result.returncode == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GOOGLE SHEETS: LOW-LEVEL CLIENT + QUOTA-AWARE RETRY WRAPPER
+# ═══════════════════════════════════════════════════════════════════════════
+
+GOOGLE_SHEET_ID                 = get_env("GOOGLE_SHEET_ID")
+GOOGLE_APPLICATION_CREDENTIALS  = get_env("GOOGLE_APPLICATION_CREDENTIALS", required=False) or "google_creds.json"
+SHEETS_RETRY_BUDGET_SECONDS     = get_int_env("SHEETS_RETRY_BUDGET_SECONDS", 240)   # per call
+SHEETS_MAX_BACKOFF_SECONDS      = get_int_env("SHEETS_MAX_BACKOFF_SECONDS", 60)
+START_JITTER_MAX_SECONDS        = get_int_env("START_JITTER_MAX_SECONDS", 45)
+# Small pause between consecutive Sheets calls from this one process, purely
+# to smooth out bursts (a cycle only makes a handful of calls, so this adds
+# at most ~1-2s of latency per cycle — cheap insurance against quota spikes).
+SHEETS_CALL_PACING_SECONDS      = get_float_env("SHEETS_CALL_PACING_SECONDS", "0.3")
+
+_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+_creds  = service_account.Credentials.from_service_account_file(
+    GOOGLE_APPLICATION_CREDENTIALS, scopes=_SCOPES
+)
+_service = build("sheets", "v4", credentials=_creds, cache_discovery=False)
+_sheets  = _service.spreadsheets()
+
+
+def _is_quota_error(exc):
+    if not isinstance(exc, HttpError):
+        return False
+    status = getattr(exc.resp, "status", None)
+    body = ""
+    try:
+        body = exc.content.decode("utf-8", "ignore") if isinstance(exc.content, bytes) else str(exc.content)
+    except Exception:
+        body = str(exc)
+    return (
+        status == 429
+        or "RESOURCE_EXHAUSTED" in body
+        or "rateLimitExceeded" in body
+        or "Quota exceeded" in body
+        or "quotaExceeded" in body
+    )
+
+
+def sheets_call(fn, *args, budget_seconds=None, **kwargs):
+    """Run any googleapiclient call with exponential backoff + jitter on
+    quota errors and transient 5xx. Retries for up to `budget_seconds`
+    (default SHEETS_RETRY_BUDGET_SECONDS) before giving up and re-raising —
+    at which point the caller (a cycle-level try/except in run_once/main)
+    is expected to skip this cycle rather than crash the whole job."""
+    budget = budget_seconds if budget_seconds is not None else SHEETS_RETRY_BUDGET_SECONDS
+    start = time.time()
+    attempt = 0
+    while True:
+        try:
+            result = fn(*args, **kwargs).execute()
+            if SHEETS_CALL_PACING_SECONDS > 0:
+                time.sleep(SHEETS_CALL_PACING_SECONDS)
+            return result
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", None)
+            transient = _is_quota_error(exc) or status in (408, 429, 500, 502, 503, 504)
+            if not transient:
+                raise
+            attempt += 1
+            elapsed = time.time() - start
+            if elapsed > budget:
+                print(f"[sheets] giving up after {attempt} attempts / {elapsed:.0f}s "
+                      f"(still hitting {'quota' if _is_quota_error(exc) else f'HTTP {status}'}).")
+                raise
+            delay = min(SHEETS_MAX_BACKOFF_SECONDS, 2 * (2 ** (attempt - 1))) + random.uniform(0, 1.5)
+            kind = "quota" if _is_quota_error(exc) else f"HTTP {status}"
+            print(f"[sheets] {kind} error (attempt {attempt}, {elapsed:.0f}s elapsed) — "
+                  f"retrying in {delay:.1f}s…")
+            time.sleep(delay)
+
+
+def qrange(tab, a1):
+    """Build an A1 range reference for a tab, quoting the tab name (safe
+    even if it contains spaces or special characters)."""
+    safe = tab.replace("'", "''")
+    return f"'{safe}'!{a1}"
+
+
+def col_letter(n):
+    letters = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        letters = chr(65 + r) + letters
+    return letters
+
+
+def sheets_get_batch(ranges):
+    return sheets_call(
+        _sheets.values().batchGet,
+        spreadsheetId=GOOGLE_SHEET_ID, ranges=ranges,
+        valueRenderOption="UNFORMATTED_VALUE",
+    )
+
+
+def sheets_get(rng):
+    return sheets_call(
+        _sheets.values().get,
+        spreadsheetId=GOOGLE_SHEET_ID, range=rng,
+        valueRenderOption="UNFORMATTED_VALUE",
+    )
+
+
+def sheets_update(rng, values):
+    return sheets_call(
+        _sheets.values().update,
+        spreadsheetId=GOOGLE_SHEET_ID, range=rng,
+        valueInputOption="USER_ENTERED", body={"values": values},
+    )
+
+
+def sheets_batch_update_values(data):
+    """data: list of {'range': A1_range, 'values': [[...]]}. One HTTP call
+    no matter how many ranges are included — always prefer this over
+    several sheets_update() calls when writing related cells together."""
+    if not data:
+        return None
+    return sheets_call(
+        _sheets.values().batchUpdate,
+        spreadsheetId=GOOGLE_SHEET_ID,
+        body={"valueInputOption": "USER_ENTERED", "data": data},
+    )
+
+
+def sheets_append(rng, values):
+    return sheets_call(
+        _sheets.values().append,
+        spreadsheetId=GOOGLE_SHEET_ID, range=rng,
+        valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+        body={"values": values},
+    )
+
+
+def sheets_existing_titles():
+    meta = sheets_call(_sheets.get, spreadsheetId=GOOGLE_SHEET_ID, fields="sheets.properties.title")
+    return {s["properties"]["title"] for s in meta.get("sheets", [])}
+
+
+REQUIRED_TABS = {
+    CREDS_TAB:    CREDENTIALS_HEADER,
+    SETTINGS_TAB: ["KEY", "VALUE"],
+    REPORT_TAB:   REPORT_HEADER,
+}
+
+
+def ensure_required_tabs():
+    """One-time (per job start) check that Credentials/Settings/Report tabs
+    and their headers exist. Uses at most 1 read + 1 batchUpdate (structure)
+    + 1 batchUpdate (headers) — never repeated mid-loop."""
+    existing = sheets_existing_titles()
+    add_requests, header_writes = [], []
+    for tab, header in REQUIRED_TABS.items():
+        if tab not in existing:
+            add_requests.append({"addSheet": {"properties": {"title": tab}}})
+            header_writes.append({"range": qrange(tab, "A1"), "values": [header]})
+    if add_requests:
+        sheets_call(_sheets.batchUpdate, spreadsheetId=GOOGLE_SHEET_ID,
+                    body={"requests": add_requests})
+        print(f"Created missing tab(s): {[r['addSheet']['properties']['title'] for r in add_requests]}")
+    if header_writes:
+        sheets_batch_update_values(header_writes)
+
+
+def ensure_settings_defaults():
+    core = load_core_data(force=True)
+    settings_existing = set(core["settings"].keys())
+    missing_rows = [[k, v] for k, v in DEFAULT_SETTINGS if k not in settings_existing]
+    if missing_rows:
+        sheets_append(qrange(SETTINGS_TAB, "A:B"), missing_rows)
+        print(f"Added {len(missing_rows)} missing default setting(s).")
+        load_core_data(force=True)   # refresh cache so this cycle sees them
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SHEET VALUE HELPERS (operate on cached 2D lists from batchGet)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def hmap(values):
+    """Header map: {UPPERCASE_HEADER_NAME: 1-based column index}."""
+    if not values:
+        return {}
+    header = {}
+    for i, v in enumerate(values[0], start=1):
+        if v is not None and str(v).strip():
+            header[str(v).strip().upper()] = i
+    return header
+
+def cell(values, row, col):
+    """1-based row/col cell lookup into a 2D list from batchGet (rows and
+    trailing empty cells are omitted by the API, so this pads safely)."""
+    if col is None or row < 1 or row > len(values):
+        return ""
+    r = values[row - 1]
+    if col > len(r):
+        return ""
+    v = r[col - 1]
+    return str(v).strip() if v is not None else ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CYCLE-LEVEL DATA LOADING (batched, cached per cycle)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_core_cache = None   # {"creds": [[...]], "settings": {...}, "report": [[...]]}
+_plan_cache = None   # {"key": (post_tab, link_tab), "by_tab": {tab: [[...]]}}
+
+
+def load_core_data(force=False):
+    """ONE batchGet call fetching Credentials + Settings + Report together.
+    This is the single read that covers everything needed for a normal
+    posting cycle except the plan sheets."""
+    global _core_cache
+    if _core_cache is not None and not force:
+        return _core_cache
+
+    ranges = [qrange(CREDS_TAB, "A:ZZ"), qrange(SETTINGS_TAB, "A:ZZ"), qrange(REPORT_TAB, "A:ZZ")]
+    res = sheets_get_batch(ranges)
+    vr = res.get("valueRanges", [])
+
+    def vals(i):
+        return vr[i].get("values", []) if i < len(vr) else []
+
+    creds_values, settings_values, report_values = vals(0), vals(1), vals(2)
 
     settings = {}
-    try:
-        service = get_sheets_service()
-        result  = service.spreadsheets().values().get(
-            spreadsheetId=MASTER_SHEET_ID, range=f"{SETTINGS_TAB}!A:B"
-        ).execute()
-        values = result.get("values", [])
-        for row in values[1:]:
-            if len(row) >= 1 and row[0].strip():
-                key = row[0].strip().upper()
-                val = row[1].strip() if len(row) > 1 else ""
-                settings[key] = val
-    except Exception as exc:
-        print(f"Note: '{SETTINGS_TAB}' tab not found or unreadable — using built-in "
-              f"defaults for shared settings ({exc}).")
+    for row in settings_values[1:]:
+        if row and str(row[0]).strip():
+            key = str(row[0]).strip().upper()
+            val = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+            settings[key] = val
 
-    _global_settings_cache = settings
-    return _global_settings_cache
+    _core_cache = {"creds": creds_values, "settings": settings, "report": report_values}
+    return _core_cache
+
+
+def load_plan_data(post_plan_tab, link_plan_tab, force=False):
+    """ONE batchGet call fetching PostPlan + LinkPlan together (only the
+    tabs that are actually configured, and only once per unique pair of
+    names per cycle)."""
+    global _plan_cache
+    key = (post_plan_tab, link_plan_tab)
+    if _plan_cache is not None and _plan_cache["key"] == key and not force:
+        return _plan_cache
+
+    tabs = []
+    if post_plan_tab:
+        tabs.append(post_plan_tab)
+    if link_plan_tab and link_plan_tab not in tabs:
+        tabs.append(link_plan_tab)
+
+    by_tab = {}
+    if tabs:
+        ranges = [qrange(t, "A:ZZ") for t in tabs]
+        res = sheets_get_batch(ranges)
+        vr = res.get("valueRanges", [])
+        for t, r in zip(tabs, vr):
+            by_tab[t] = r.get("values", [])
+
+    _plan_cache = {"key": key, "by_tab": by_tab}
+    return _plan_cache
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ACCOUNT CONFIG + LIVE SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+
+_account_config = None
+
+
+def load_global_settings(force_refresh=False):
+    return load_core_data(force=force_refresh)["settings"]
 
 
 def load_account_config(force_refresh=False):
-    global _account_config, _creds_lock_col_by, _creds_lock_col_at, _creds_status_col, _creds_status_at_col
+    global _account_config
 
     if _account_config is not None and not force_refresh:
         return _account_config
 
-    service = get_sheets_service()
-    result  = service.spreadsheets().values().get(
-        spreadsheetId=MASTER_SHEET_ID, range=CREDS_RANGE
-    ).execute()
-    values = result.get("values", [])
+    core = load_core_data(force=force_refresh)
+    creds_values = core["creds"]
+    header = hmap(creds_values)
 
-    if len(values) < 2:
-        raise RuntimeError(
-            f"'{CREDS_TAB}' in the master sheet is empty or has only a header. "
-            "Add at least one account data row."
-        )
-
-    data_idx = ACCOUNT_ROW
-    if data_idx >= len(values):
+    excel_row = ACCOUNT_ROW + 1
+    if excel_row > len(creds_values):
         raise RuntimeError(
             f"ACCOUNT_ROW={ACCOUNT_ROW} but '{CREDS_TAB}' only has "
-            f"{len(values)-1} data row(s)."
+            f"{max(0, len(creds_values) - 1)} data row(s)."
         )
-
-    header = [h.strip().upper() for h in values[0]]
-    row    = values[data_idx]
 
     def col(*names):
         for n in names:
-            try:
-                idx = header.index(n.upper())
-                return row[idx].strip() if idx < len(row) else ""
-            except ValueError:
-                continue
+            c = header.get(n.upper())
+            if c is not None:
+                return cell(creds_values, excel_row, c)
         return ""
 
-    _creds_lock_col_by = header.index("LOCKED_BY") if "LOCKED_BY" in header else None
-    _creds_lock_col_at = header.index("LOCKED_AT") if "LOCKED_AT" in header else None
-    _creds_status_col    = header.index("ACCOUNT_STATUS") if "ACCOUNT_STATUS" in header else None
-    _creds_status_at_col = header.index("ACCOUNT_STATUS_AT") if "ACCOUNT_STATUS_AT" in header else None
-
-    shared = load_global_settings(force_refresh)
+    shared = core["settings"]
     def setting(key):
         return col(key) or shared.get(key, "")
 
     raw_link     = col("LINK_URL") or "https://foodiesposts.com"
     link_url     = raw_link if raw_link.startswith("http") else f"https://{raw_link}"
-    link_display = col("LINK_DISPLAY_TEXT") or link_url.replace("https://","").replace("http://","")
+    link_display = col("LINK_DISPLAY_TEXT") or link_url.replace("https://", "").replace("http://", "")
 
     img_ratio_raw  = _parse_pct(setting("IMAGE_RATIO"), 0.60)
     vid_ratio_raw  = _parse_pct(setting("VIDEO_RATIO"), 0.40)
@@ -388,8 +575,8 @@ def load_account_config(force_refresh=False):
         "row_num":               ACCOUNT_ROW,
 
         "image_ratio":              image_ratio,
-        "video_ratio":               video_ratio,
-        "link_ratio":                link_ratio,
+        "video_ratio":              video_ratio,
+        "link_ratio":               link_ratio,
         "hashtags_enabled_image":   _parse_bool(setting("HASHTAGS_ENABLED_IMAGE"), True),
         "hashtags_enabled_video":   _parse_bool(setting("HASHTAGS_ENABLED_VIDEO"), False),
         "hashtags_enabled_link":    _parse_bool(setting("HASHTAGS_ENABLED_LINK"), True),
@@ -405,7 +592,7 @@ def load_account_config(force_refresh=False):
         "report_times_per_day":     _parse_int(setting("REPORT_TIMES_PER_DAY"), 1),
         "top_posts_count":          _parse_int(setting("TOP_POSTS_COUNT"), 1),
         "top_posts_within":         _parse_int(setting("TOP_POSTS_WITHIN"), 30),
-        "post_plan_sheet_name":     setting("POST_PLAN_SHEET_NAME") or "Sheet1",
+        "post_plan_sheet_name":     setting("POST_PLAN_SHEET_NAME") or "PostPlan",
         "link_plan_sheet_name":     setting("LINK_PLAN_SHEET_NAME") or "LinkPlan",
         "loop_interval_seconds":    _parse_int(setting("LOOP_INTERVAL_SECONDS"),
                                                 DEFAULT_LOOP_INTERVAL_SECONDS),
@@ -413,6 +600,7 @@ def load_account_config(force_refresh=False):
         "locked_by": col("LOCKED_BY"),
         "locked_at": col("LOCKED_AT"),
         "account_status": col("ACCOUNT_STATUS"),
+        "has_lock_columns": ("LOCKED_BY" in header and "LOCKED_AT" in header),
     }
 
     if not cfg["handle"]:
@@ -431,40 +619,102 @@ def refresh_account_config():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CROSS-REPO SOFT LOCK (unchanged)
+#  AUTO ACCOUNT-ROW ASSIGNMENT
+#  (only exercised when ACCOUNT_ROW isn't set explicitly — the shipped
+#  workflow always passes it via the matrix, so this is a fallback path)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def resolve_account_row():
+    explicit = get_env("ACCOUNT_ROW", required=False)
+    if explicit:
+        row = _parse_int(explicit, 1)
+        print(f"ACCOUNT_ROW={row} was explicitly set — using it as a manual override "
+              f"(auto-assignment skipped).")
+        return row
+
+    core = load_core_data(force=True)
+    creds_values = core["creds"]
+    header = hmap(creds_values)
+
+    def hidx(*names):
+        for n in names:
+            if n.upper() in header:
+                return header[n.upper()]
+        return None
+
+    handle_col = hidx("BSKY_HANDLE")
+    repo_col   = hidx("ASSIGNED_REPO")
+    status_col = hidx("ASSIGNED_STATUS")
+    at_col     = hidx("ASSIGNED_AT")
+
+    if handle_col is None or repo_col is None or status_col is None:
+        raise RuntimeError(
+            f"Auto row-assignment needs 'BSKY_HANDLE', 'ASSIGNED_REPO' and "
+            f"'ASSIGNED_STATUS' columns in '{CREDS_TAB}'. Add any missing ones "
+            f"to the header row, or set ACCOUNT_ROW manually for this run."
+        )
+
+    max_row = len(creds_values)
+
+    for excel_row in range(2, max_row + 1):
+        if cell(creds_values, excel_row, repo_col) == CURRENT_REPO:
+            handle = cell(creds_values, excel_row, handle_col)
+            data_idx = excel_row - 1
+            print(f"Repo '{CURRENT_REPO}' already owns Credentials row {data_idx} "
+                  f"({handle or 'no handle'}) — reusing it.")
+            return data_idx
+
+    for excel_row in range(2, max_row + 1):
+        handle_val = cell(creds_values, excel_row, handle_col)
+        status_val = cell(creds_values, excel_row, status_col)
+        if not handle_val:
+            continue
+        if status_val.lower() == ASSIGN_STATUS_IN_USE.lower():
+            continue
+
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        data = [
+            {"range": qrange(CREDS_TAB, f"{col_letter(repo_col)}{excel_row}"), "values": [[CURRENT_REPO]]},
+            {"range": qrange(CREDS_TAB, f"{col_letter(status_col)}{excel_row}"), "values": [[ASSIGN_STATUS_IN_USE]]},
+        ]
+        if at_col is not None:
+            data.append({"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"), "values": [[now]]})
+        sheets_batch_update_values(data)   # 1 write call for all 2-3 cells
+
+        data_idx = excel_row - 1
+        print(f"Claimed Credentials row {data_idx} ({handle_val}) for repo '{CURRENT_REPO}'.")
+        return data_idx
+
+    raise RuntimeError(
+        f"No available account rows left in '{CREDS_TAB}' — every configured "
+        f"row is already marked '{ASSIGN_STATUS_IN_USE}'. Add a new account "
+        f"row, or clear ASSIGNED_REPO/ASSIGNED_STATUS on one you want to free up."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CROSS-REPO SOFT LOCK (business-level "who owns this account row right now")
 # ═══════════════════════════════════════════════════════════════════════════
 
 class AccountLockedElsewhereError(Exception):
     """Non-fatal — another repo currently owns this account row."""
 
 
-def _write_lock_heartbeat(owner, ts):
-    try:
-        service = get_sheets_service()
-        by_col  = _col_letter(_creds_lock_col_by)
-        at_col  = _col_letter(_creds_lock_col_at)
-        sheet_row = ACCOUNT_ROW + 1
-        service.spreadsheets().values().update(
-            spreadsheetId=MASTER_SHEET_ID,
-            range=f"{CREDS_TAB}!{by_col}{sheet_row}:{at_col}{sheet_row}",
-            valueInputOption="RAW",
-            body={"values": [[owner, ts]]},
-        ).execute()
-        if _account_config:
-            _account_config["locked_by"] = owner
-            _account_config["locked_at"] = ts
-    except Exception as exc:
-        print(f"Warning: could not write account lock heartbeat: {exc}")
-
-
 def try_acquire_account_lock():
-    cfg = refresh_account_config()
+    global _account_config
 
-    if _creds_lock_col_by is None or _creds_lock_col_at is None:
-        return True
+    core = load_core_data(force=True)   # fresh read right before the check, to narrow the race window
+    creds_values = core["creds"]
+    header = hmap(creds_values)
+    by_col = header.get("LOCKED_BY")
+    at_col = header.get("LOCKED_AT")
+    excel_row = ACCOUNT_ROW + 1
 
-    locked_by     = cfg.get("locked_by", "")
-    locked_at_raw = cfg.get("locked_at", "")
+    if by_col is None or at_col is None:
+        return True   # no lock columns configured -> treat as always acquired
+
+    locked_by     = cell(creds_values, excel_row, by_col)
+    locked_at_raw = cell(creds_values, excel_row, at_col)
 
     stale = True
     if locked_at_raw:
@@ -479,38 +729,44 @@ def try_acquire_account_lock():
               f"(last heartbeat {locked_at_raw} UTC, TTL {LOCK_TTL_MINUTES}m). Skipping this run.")
         return False
 
-    _write_lock_heartbeat(CURRENT_REPO, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    sheets_batch_update_values([
+        {"range": qrange(CREDS_TAB, f"{col_letter(by_col)}{excel_row}"), "values": [[CURRENT_REPO]]},
+        {"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"), "values": [[now]]},
+    ])
+    if _account_config:
+        _account_config["locked_by"] = CURRENT_REPO
+        _account_config["locked_at"] = now
     return True
 
 
 def _write_account_status(status):
-    """Writes a human-readable status directly onto this account's own
-    Sheet1 row (e.g. 'Active', 'Banned', 'Auth Failed')."""
     global _account_config
-    if _creds_status_col is None:
-        print("Note: no ACCOUNT_STATUS column in Sheet1 — add one to track per-row status.")
+
+    core = load_core_data(force=True)
+    header = hmap(core["creds"])
+    status_col = header.get("ACCOUNT_STATUS")
+    if status_col is None:
+        print("Note: no ACCOUNT_STATUS column in Credentials — add one to track per-row status.")
         return
+    at_col = header.get("ACCOUNT_STATUS_AT")
+    excel_row = ACCOUNT_ROW + 1
+
+    data = [{"range": qrange(CREDS_TAB, f"{col_letter(status_col)}{excel_row}"), "values": [[status]]}]
+    if at_col is not None:
+        data.append({"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"), "values": [[_now_str()]]})
+
     try:
-        service   = get_sheets_service()
-        sheet_row = ACCOUNT_ROW + 1
-        status_col = _col_letter(_creds_status_col)
-        data = [{"range": f"{CREDS_TAB}!{status_col}{sheet_row}", "values": [[status]]}]
-        if _creds_status_at_col is not None:
-            at_col = _col_letter(_creds_status_at_col)
-            data.append({"range": f"{CREDS_TAB}!{at_col}{sheet_row}", "values": [[_now_str()]]})
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=MASTER_SHEET_ID,
-            body={"valueInputOption": "RAW", "data": data},
-        ).execute()
+        sheets_batch_update_values(data)
         if _account_config:
             _account_config["account_status"] = status
-        print(f"Sheet1 ACCOUNT_STATUS set to '{status}' for row {ACCOUNT_ROW}.")
+        print(f"Credentials ACCOUNT_STATUS set to '{status}' for row {ACCOUNT_ROW}.")
     except Exception as exc:
         print(f"Warning: could not update ACCOUNT_STATUS: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TEXT HELPERS (unchanged)
+#  TEXT HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _posting_handle():
@@ -530,7 +786,7 @@ def replace_urls(text):
 
 def print_config_summary():
     cfg = _cfg()
-    print("── Run config (live from 'Settings' tab + Sheet1, re-checked every cycle) ──")
+    print("── Run config (live from Settings + Credentials in Google Sheets) ──")
     print(f"  Account row:              {cfg['row_num']}  ({_posting_handle()})")
     print(f"  Account status:           {cfg.get('account_status') or '(not set)'}")
     print(f"  Mega upload folder:       {cfg['mega_upload_folder'] or '(not set!)'}")
@@ -555,19 +811,21 @@ def print_config_summary():
         print(f"  Report frequency:         {cfg['report_times_per_day']}x per 24h")
         print(f"  Top posts combined:       {cfg['top_posts_count']}")
         print(f"  Scan last N posts:        {cfg['top_posts_within']}")
-    print(f"  Post-plan tab (media):    {cfg['post_plan_sheet_name']}")
-    print(f"  LinkPlan tab (previewLink): {cfg['link_plan_sheet_name']}")
-    print(f"  Google auth:              service account (GOOGLE_APPLICATION_CREDENTIALS)")
-    if _creds_lock_col_by is not None:
+    print(f"  Post-plan sheet (media):  {cfg['post_plan_sheet_name']}")
+    print(f"  LinkPlan sheet:           {cfg['link_plan_sheet_name']}")
+    print(f"  Config source:            Google Sheet ({GOOGLE_SHEET_ID})")
+    if cfg.get("has_lock_columns"):
         print(f"  Cross-repo lock:          enabled (owner={cfg.get('locked_by') or '—'}, "
               f"last heartbeat={cfg.get('locked_at') or '—'})")
     else:
         print("  Cross-repo lock:          disabled (add LOCKED_BY / LOCKED_AT columns to enable)")
+    print(f"  Sheets retry budget:      {SHEETS_RETRY_BUDGET_SECONDS}s per call "
+          f"(max backoff {SHEETS_MAX_BACKOFF_SECONDS}s)")
     print("─────────────────────────────────────────────────")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  REPORT TAB (unchanged)
+#  REPORT TAB
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _now_str():
@@ -580,63 +838,27 @@ def _parse_report_ts(s):
         return None
 
 
-def _ensure_report_tab(service):
-    try:
-        meta     = service.spreadsheets().get(spreadsheetId=MASTER_SHEET_ID).execute()
-        existing = {s["properties"]["title"].strip().lower()
-                    for s in meta.get("sheets", [])}
-        if REPORT_TAB.lower() not in existing:
-            service.spreadsheets().batchUpdate(
-                spreadsheetId=MASTER_SHEET_ID,
-                body={"requests": [{"addSheet": {"properties": {"title": REPORT_TAB}}}]},
-            ).execute()
-            print(f"Created '{REPORT_TAB}' tab.")
-    except Exception as exc:
-        if "already exists" not in str(exc).lower():
-            print(f"Warning: could not verify/create Report tab: {exc}")
-
-    last_col = _col_letter(len(REPORT_HEADER) - 1)
-    try:
-        r = service.spreadsheets().values().get(
-            spreadsheetId=MASTER_SHEET_ID, range=f"{REPORT_TAB}!A1:{last_col}1"
-        ).execute()
-        existing_header = r.get("values", [[]])[0] if r.get("values") else []
-        if existing_header != REPORT_HEADER:
-            service.spreadsheets().values().update(
-                spreadsheetId=MASTER_SHEET_ID,
-                range=f"{REPORT_TAB}!A1:{last_col}1",
-                valueInputOption="RAW",
-                body={"values": [REPORT_HEADER]},
-            ).execute()
-            print(f"Set '{REPORT_TAB}' header to: {REPORT_HEADER}")
-    except Exception as exc:
-        print(f"Warning: could not check/update report header: {exc}")
-
-
-def _last_report_for_handle(service, handle):
-    try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=MASTER_SHEET_ID, range=f"{REPORT_TAB}!A:G"
-        ).execute()
-        rows = result.get("values", [])[1:]
-        for row in reversed(rows):
-            if len(row) >= 2 and row[1] == handle:
-                ts = row[0] if len(row) > 0 else None
-                followers = None
-                if len(row) > 2 and row[2].strip():
-                    try:
-                        followers = int(row[2])
-                    except ValueError:
-                        followers = None
-                return ts, followers
-    except Exception:
-        pass
+def _last_report_for_handle(handle):
+    """Reads from the already-cached core data — no extra API call."""
+    report_values = load_core_data()["report"]
+    for r in range(len(report_values), 1, -1):
+        h = cell(report_values, r, 2)
+        if h == handle:
+            ts = cell(report_values, r, 1)
+            followers = None
+            f_raw = cell(report_values, r, 3)
+            if f_raw:
+                try:
+                    followers = int(float(f_raw))
+                except ValueError:
+                    followers = None
+            return ts, followers
     return None, None
 
 
-def _report_due(service, handle, times_per_day):
+def _report_due(handle, times_per_day):
     times_per_day = max(1, times_per_day)
-    last_ts, _ = _last_report_for_handle(service, handle)
+    last_ts, _ = _last_report_for_handle(handle)
     if last_ts is None:
         return True
     last_epoch = _parse_report_ts(last_ts)
@@ -646,14 +868,9 @@ def _report_due(service, handle, times_per_day):
     return (time.time() - last_epoch) >= interval_seconds
 
 
-def _append_report(service, rows):
-    service.spreadsheets().values().append(
-        spreadsheetId=MASTER_SHEET_ID,
-        range=f"{REPORT_TAB}!A:G",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows},
-    ).execute()
+def _append_report(rows):
+    sheets_append(qrange(REPORT_TAB, "A:G"), rows)
+    load_core_data(force=True)   # refresh cache so subsequent checks this cycle see the new row
 
 
 def _top_post_summary(client, handle, top_n, within):
@@ -698,15 +915,17 @@ def _top_post_summary(client, handle, top_n, within):
     return " | ".join(parts), ranked[0]["engagement"]
 
 
-def generate_report(client, handle, service, cfg):
-    if not _report_due(service, handle, cfg["report_times_per_day"]):
+def generate_report(client, handle, cfg):
+    """All Bluesky API calls happen with no Sheets calls in between; only
+    the final _append_report touches the sheet, and only once."""
+    if not _report_due(handle, cfg["report_times_per_day"]):
         print(f"Report for {handle} not due yet (limit: {cfg['report_times_per_day']}x/24h).")
         return
     try:
         profile = client.get_profile(actor=handle)
         total   = profile.followers_count or 0
 
-        _, prev_followers = _last_report_for_handle(service, handle)
+        _, prev_followers = _last_report_for_handle(handle)
         prev   = prev_followers if prev_followers is not None else total
         gained = total - prev
 
@@ -715,7 +934,7 @@ def generate_report(client, handle, service, cfg):
         )
 
         row = [_now_str(), handle, total, gained, top_preview, top_engagement, "OK"]
-        _append_report(service, [row])
+        _append_report([row])
         print(f"Report logged for {handle}: {total} followers ({gained:+d} since last), "
               f"top post engagement={top_engagement}.")
     except Exception as exc:
@@ -724,9 +943,7 @@ def generate_report(client, handle, service, cfg):
 
 def run_report(client, handle, cfg):
     try:
-        service = get_sheets_service()
-        _ensure_report_tab(service)
-        generate_report(client, handle, service, cfg)
+        generate_report(client, handle, cfg)
     except Exception as exc:
         print(f"Warning: report generation failed: {exc}")
 
@@ -747,9 +964,7 @@ class NoPreviewError(Exception):
 
 def log_account_problem(handle, status):
     try:
-        service = get_sheets_service()
-        _ensure_report_tab(service)
-        _append_report(service, [[_now_str(), handle, "", "", "", "", status]])
+        _append_report([[_now_str(), handle, "", "", "", "", status]])
         print(f"Logged '{status}' for {handle}.")
     except Exception as exc:
         print(f"Warning: could not log account status: {exc}")
@@ -784,8 +999,7 @@ def get_account_hashtags():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  LINK-IN-POST DECISION (unrelated to the previewLink post type — this is
-#  the "append a CTA link" toggle inside image/video captions)
+#  LINK-IN-POST DECISION
 # ═══════════════════════════════════════════════════════════════════════════
 
 def should_add_link(kind):
@@ -797,8 +1011,7 @@ def should_add_link(kind):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  POST-TYPE SELECTION — image / video / previewLink, weighted by the
-#  normalized IMAGE_RATIO / VIDEO_RATIO / LINK_RATIO settings.
+#  POST-TYPE SELECTION
 # ═══════════════════════════════════════════════════════════════════════════
 
 def choose_media_kind():
@@ -811,11 +1024,11 @@ def choose_media_kind():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  POST-PLAN SHEET (File Name + Caption + Status) — image/video media
+#  POST-PLAN SHEET (File Name + Caption + Status)
 # ═══════════════════════════════════════════════════════════════════════════
 
 _post_plan_cache          = None
-_post_plan_status_col_idx = None
+_post_plan_status_col_idx = None   # 1-based col index
 
 
 def get_post_plan_tab_name():
@@ -827,21 +1040,23 @@ def load_post_plan(force_refresh=False):
     if _post_plan_cache is not None and not force_refresh:
         return _post_plan_cache
 
-    tab     = get_post_plan_tab_name()
-    service = get_sheets_service()
-    result  = service.spreadsheets().values().get(
-        spreadsheetId=POST_PLAN_SHEET_ID, range=f"{tab}!A:Z"
-    ).execute()
-    values  = result.get("values", [])
+    tab_name = get_post_plan_tab_name()
+    link_tab = get_link_plan_tab_name()
+    plans = load_plan_data(tab_name, link_tab, force=force_refresh)
+    values = plans["by_tab"].get(tab_name, [])
+
     if not values:
-        print(f"Warning: post-plan tab '{tab}' is empty.")
+        print(f"Warning: post-plan sheet '{tab_name}' not found (or empty) in the spreadsheet — "
+              f"add a tab with that name (File Name / Caption / Status columns).")
         _post_plan_cache = {}
         return _post_plan_cache
 
-    header = [h.strip().lower() for h in values[0]]
+    header = hmap(values)
+
     def ci(*names):
         for n in names:
-            if n in header: return header.index(n)
+            if n.upper() in header:
+                return header[n.upper()]
         return None
 
     file_idx    = ci("file name", "filename", "file")
@@ -850,7 +1065,7 @@ def load_post_plan(force_refresh=False):
     _post_plan_status_col_idx = status_idx
 
     if file_idx is None or caption_idx is None:
-        print(f"Warning: post-plan needs 'File Name' and 'Caption' columns. Found: {header}")
+        print(f"Warning: post-plan needs 'File Name' and 'Caption' columns. Found: {list(header)}")
         _post_plan_cache = {}
         return _post_plan_cache
     if status_idx is None:
@@ -859,15 +1074,17 @@ def load_post_plan(force_refresh=False):
     plan_exact = {}
     plan_lower = {}
     already    = 0
-    for i, row in enumerate(values[1:], start=2):
-        fname   = row[file_idx].strip()    if len(row) > file_idx    else ""
-        caption = row[caption_idx].strip() if len(row) > caption_idx else ""
-        status  = row[status_idx].strip()  if status_idx is not None and len(row) > status_idx else ""
-        if not fname: continue
-        entry = {"caption": caption, "row": i, "status": status}
+    for excel_row in range(2, len(values) + 1):
+        fname   = cell(values, excel_row, file_idx)
+        caption = cell(values, excel_row, caption_idx)
+        status  = cell(values, excel_row, status_idx) if status_idx else ""
+        if not fname:
+            continue
+        entry = {"caption": caption, "row": excel_row, "status": status}
         plan_exact[fname]         = entry
         plan_lower[fname.lower()] = entry
-        if status.lower() == POSTED_STATUS_VALUE: already += 1
+        if status.lower() == POSTED_STATUS_VALUE:
+            already += 1
 
     print(f"Loaded {len(plan_exact)} post-plan rows ({already} already posted).")
     _post_plan_cache = {"exact": plan_exact, "lower": plan_lower}
@@ -889,21 +1106,18 @@ def mark_posted(filename, row_number, retries=3):
     if _post_plan_status_col_idx is None:
         print(f"Warning: no 'Status' column — cannot mark '{filename}' as posted.")
         return
+
+    tab_name = get_post_plan_tab_name()
+    rng = qrange(tab_name, f"{col_letter(_post_plan_status_col_idx)}{row_number}")
+
     for attempt in range(1, retries + 1):
         try:
-            tab     = get_post_plan_tab_name()
-            col_l   = _col_letter(_post_plan_status_col_idx)
-            service = get_sheets_service()
-            service.spreadsheets().values().update(
-                spreadsheetId=POST_PLAN_SHEET_ID,
-                range=f"{tab}!{col_l}{row_number}",
-                valueInputOption="RAW",
-                body={"values": [[POSTED_STATUS_VALUE]]},
-            ).execute()
+            sheets_update(rng, [[POSTED_STATUS_VALUE]])
             if _post_plan_cache:
-                for d in (_post_plan_cache.get("exact",{}), _post_plan_cache.get("lower",{})):
-                    if filename in d: d[filename]["status"] = POSTED_STATUS_VALUE
-                    if filename.lower() in d: d[filename.lower()]["status"] = POSTED_STATUS_VALUE
+                for d in (_post_plan_cache.get("exact", {}), _post_plan_cache.get("lower", {})):
+                    for entry in d.values():
+                        if entry["row"] == row_number:
+                            entry["status"] = POSTED_STATUS_VALUE
             print(f"Marked '{filename}' row {row_number} as posted.")
             return
         except Exception as exc:
@@ -917,45 +1131,51 @@ def mark_posted(filename, row_number, retries=3):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  LINKPLAN SHEET (URL + Caption + Status) — previewLink posts. Same
-#  claim/post/mark-posted pattern as the post-plan sheet above, just keyed
-#  on URL instead of a media filename (there's no file to download).
+#  LINKPLAN SHEET (URL + Caption + Status)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_link_plan_tab_name():
     return _cfg()["link_plan_sheet_name"]
 
 
-def load_link_plan(service):
-    tab = get_link_plan_tab_name()
-    values = service.spreadsheets().values().get(
-        spreadsheetId=LINK_PLAN_SHEET_ID, range=f"{tab}!A:C"
-    ).execute().get("values", [])
-    if len(values) < 2:
+def load_link_plan(force_refresh=False):
+    tab_name  = get_link_plan_tab_name()
+    post_tab  = get_post_plan_tab_name()
+    plans = load_plan_data(post_tab, tab_name, force=force_refresh)
+    values = plans["by_tab"].get(tab_name, [])
+    if not values:
         return []
-    header = [h.strip().lower() for h in values[0]]
+
+    header = hmap(values)
+
     def ci(*names):
         for n in names:
-            if n in header:
-                return header.index(n)
+            if n.upper() in header:
+                return header[n.upper()]
         return None
-    url_idx, cap_idx, status_idx = ci("url"), ci("caption"), ci("status")
-    if url_idx is None:
-        raise RuntimeError(f"'{tab}' needs a 'URL' column.")
 
-    rows = []
-    for i, row in enumerate(values[1:], start=2):
-        url = row[url_idx].strip() if len(row) > url_idx else ""
+    url_idx    = ci("url")
+    cap_idx    = ci("caption")
+    status_idx = ci("status")
+    if url_idx is None:
+        raise RuntimeError(f"'{tab_name}' needs a 'URL' column.")
+
+    out = []
+    for excel_row in range(2, len(values) + 1):
+        url = cell(values, excel_row, url_idx)
         if not url:
             continue
-        caption = row[cap_idx].strip() if cap_idx is not None and len(row) > cap_idx else ""
-        status  = row[status_idx].strip() if status_idx is not None and len(row) > status_idx else ""
-        rows.append({"url": url, "caption": caption, "status": status, "row": i, "status_col": status_idx})
-    return rows
+        caption = cell(values, excel_row, cap_idx) if cap_idx else ""
+        status  = cell(values, excel_row, status_idx) if status_idx else ""
+        out.append({
+            "url": url, "caption": caption, "status": status,
+            "row": excel_row, "status_col": status_idx,
+        })
+    return out
 
 
-def pick_next_url(service):
-    plan = load_link_plan(service)
+def pick_next_url():
+    plan = load_link_plan()
     for entry in plan:
         s = entry["status"].lower()
         if s == POSTED_STATUS_VALUE or s.startswith(CLAIM_PREFIX.lower()):
@@ -964,58 +1184,48 @@ def pick_next_url(service):
     return None
 
 
-def claim_url_row(service, entry):
-    """Soft-claims a row by writing CLAIMED_<runtag> into Status, so two
-    concurrent runners don't grab the same URL. Returns True if the claim
-    stuck (nobody else claimed it first)."""
+def claim_url_row(entry):
+    """Read-fresh-then-write on just this one cell to narrow (not fully
+    eliminate) the race between two runners claiming the same LinkPlan row.
+    This mirrors how LinkPlan claiming already worked before the Mega
+    rewrite — it's an optimistic claim, not a hard lock."""
     if entry["status_col"] is None:
         return True
-    tab = get_link_plan_tab_name()
-    col_l = _col_letter(entry["status_col"])
+    tab_name  = get_link_plan_tab_name()
+    rng       = qrange(tab_name, f"{col_letter(entry['status_col'])}{entry['row']}")
     claim_val = f"{CLAIM_PREFIX}{RUN_TAG}"
-    service.spreadsheets().values().update(
-        spreadsheetId=LINK_PLAN_SHEET_ID, range=f"{tab}!{col_l}{entry['row']}",
-        valueInputOption="RAW", body={"values": [[claim_val]]},
-    ).execute()
-    check = service.spreadsheets().values().get(
-        spreadsheetId=LINK_PLAN_SHEET_ID, range=f"{tab}!{col_l}{entry['row']}"
-    ).execute().get("values", [[""]])
-    return check[0][0].strip() == claim_val if check else False
+
+    fresh = sheets_get(rng)
+    current_rows = fresh.get("values", [])
+    current = str(current_rows[0][0]).strip() if current_rows and current_rows[0] else ""
+    if current.lower() == POSTED_STATUS_VALUE or current.lower().startswith(CLAIM_PREFIX.lower()):
+        return False   # someone else got there first
+
+    sheets_update(rng, [[claim_val]])
+    return True
 
 
-def mark_url_posted(service, entry):
+def mark_url_posted(entry):
     if entry["status_col"] is None:
         return
-    tab = get_link_plan_tab_name()
-    col_l = _col_letter(entry["status_col"])
-    service.spreadsheets().values().update(
-        spreadsheetId=LINK_PLAN_SHEET_ID, range=f"{tab}!{col_l}{entry['row']}",
-        valueInputOption="RAW", body={"values": [[POSTED_STATUS_VALUE]]},
-    ).execute()
+    tab_name = get_link_plan_tab_name()
+    rng = qrange(tab_name, f"{col_letter(entry['status_col'])}{entry['row']}")
+    sheets_update(rng, [[POSTED_STATUS_VALUE]])
 
 
-def release_url_claim(service, entry):
+def release_url_claim(entry):
     if entry["status_col"] is None:
         return
+    tab_name = get_link_plan_tab_name()
+    rng = qrange(tab_name, f"{col_letter(entry['status_col'])}{entry['row']}")
     try:
-        tab = get_link_plan_tab_name()
-        col_l = _col_letter(entry["status_col"])
-        service.spreadsheets().values().update(
-            spreadsheetId=LINK_PLAN_SHEET_ID, range=f"{tab}!{col_l}{entry['row']}",
-            valueInputOption="RAW", body={"values": [[""]]},
-        ).execute()
+        sheets_update(rng, [[""]])
     except Exception as exc:
         print(f"Warning: could not release claim on LinkPlan row {entry['row']}: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  LINK PREVIEW (og:title / og:description / og:image) for previewLink posts
-#
-#  PRIMARY PATH: Bluesky's own card-generation service, cardyb
-#  (https://cardyb.bsky.app/v1/extract) — the same backend the official
-#  Bluesky app/web client hits when you paste a link into the composer.
-#  FALLBACK PATH: manually scrape the page's own <meta> tags if cardyb is
-#  unreachable or returns nothing usable after retries.
+#  LINK PREVIEW
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fetch_link_metadata(url, timeout=20):
@@ -1064,7 +1274,9 @@ def _fetch_link_metadata_manual(url, timeout=20):
                 print(f"Retrying in {delay}s…")
                 time.sleep(delay)
 
-    raise NoPreviewError(f"Failed to fetch {url} after {LINK_PREVIEW_MAX_RETRIES} attempts (cardyb + manual)") from last_exc
+    raise NoPreviewError(
+        f"Failed to fetch {url} after {LINK_PREVIEW_MAX_RETRIES} attempts (cardyb + manual)"
+    ) from last_exc
 
 
 def _parse_link_metadata(resp):
@@ -1089,8 +1301,6 @@ def _parse_link_metadata(resp):
 
 
 def upload_link_thumbnail(client, image_url, referer, max_bytes, timeout=20):
-    """Download the preview image (if any) and upload it as a blob for the
-    card, retrying transient failures and shrinking it if it's over size."""
     if not image_url:
         print("No preview image found — posting without a thumbnail.")
         return None
@@ -1146,9 +1356,6 @@ def _compress_link_thumb(data, max_bytes):
 MAX_POST_GRAPHEMES = 300
 
 def build_link_caption_text(caption, tags, fallback_url=None):
-    # NOTE: strip only spaces/tabs here, not newlines — compose_fallback_caption
-    # intentionally prepends a leading "\n" before the title, and a plain
-    # .strip() would silently remove it.
     text = _URL_RE.sub("", caption or "").strip(" \t\r")
     if fallback_url:
         text = f"{text}\n{fallback_url}".strip(" \t\r") if text else fallback_url
@@ -1198,9 +1405,6 @@ def build_external_embed(client, preview, max_thumb_bytes, timeout):
 
 
 def compose_fallback_caption(preview):
-    """When the sheet has no Caption for a row, build one from the fetched
-    preview instead: a blank line, then og:title, then description
-    directly underneath. Hashtags still get appended after this block."""
     if not preview:
         return ""
     title = (preview.get("title") or "").strip()
@@ -1220,8 +1424,6 @@ def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes, auto_ca
         print(f"  title: {preview['title']!r}")
         embed = build_external_embed(client, preview, max_thumb_bytes, timeout)
     except Exception as exc:
-        # Don't let a bad preview fetch kill the whole cycle — fall back
-        # to a plain post that still includes the link as text.
         print(f"Warning: preview fetch failed ({exc}); posting as plain link instead.")
 
     used_auto_caption = False
@@ -1244,7 +1446,7 @@ def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes, auto_ca
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MEGA.NZ HELPERS (via rclone) — image/video media
+#  MEGA.NZ HELPERS (via rclone) — image/video media, unchanged
 # ═══════════════════════════════════════════════════════════════════════════
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".avif", ".heic"}
@@ -1258,38 +1460,6 @@ def _kind_from_filename(filename):
     if ext in _VIDEO_EXTS:
         return "video"
     return None
-
-
-def _rclone_run(args):
-    return subprocess.run(["rclone", "--config", RCLONE_CONFIG_PATH] + args,
-                           capture_output=True, text=True)
-
-
-def rclone_list_files(remote_folder):
-    result = _rclone_run(["lsf", remote_folder, "--files-only"])
-    if result.returncode != 0:
-        print(f"Warning: rclone lsf failed for '{remote_folder}': {result.stderr.strip()[-300:]}")
-        return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
-
-
-def rclone_claim(remote_folder, name):
-    """Server-side rename to claim a file. If another runner already
-    claimed/moved it, moveto fails harmlessly and we just try the next
-    candidate — this is the Mega equivalent of the old Drive claim-rename."""
-    claimed_name = f"{CLAIM_PREFIX}{RUN_TAG}__{name}"
-    result = _rclone_run(["moveto", f"{remote_folder}/{name}", f"{remote_folder}/{claimed_name}"])
-    return claimed_name if result.returncode == 0 else None
-
-
-def rclone_download(remote_folder, filename, local_path):
-    result = _rclone_run(["copyto", f"{remote_folder}/{filename}", local_path])
-    return result.returncode == 0
-
-
-def rclone_move(src, dst):
-    result = _rclone_run(["moveto", src, dst])
-    return result.returncode == 0
 
 
 def fetch_media_matching_plan(preferred_kind, plan):
@@ -1350,21 +1520,24 @@ def compress_image_under_limit(local_path):
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=q, optimize=True)
         if buf.tell() <= max_bytes:
-            with open(local_path, "wb") as f: f.write(buf.getvalue())
+            with open(local_path, "wb") as f:
+                f.write(buf.getvalue())
             print(f"Compressed {orig/1024:.0f} KB → {buf.tell()/1024:.0f} KB (q={q}).")
             return local_path
     w, h = img.size
     scale = 0.9
     while scale > 0.3:
-        r = img.resize((max(1,int(w*scale)), max(1,int(h*scale))), Image.LANCZOS)
+        r = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
         buf = io.BytesIO()
         r.save(buf, format="JPEG", quality=70, optimize=True)
         if buf.tell() <= max_bytes:
-            with open(local_path, "wb") as f: f.write(buf.getvalue())
+            with open(local_path, "wb") as f:
+                f.write(buf.getvalue())
             print(f"Resized+compressed → {buf.tell()/1024:.0f} KB.")
             return local_path
         scale -= 0.1
-    with open(local_path, "wb") as f: f.write(buf.getvalue())
+    with open(local_path, "wb") as f:
+        f.write(buf.getvalue())
     print(f"Warning: best-effort compression = {buf.tell()/1024:.0f} KB.")
     return local_path
 
@@ -1474,48 +1647,29 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DISCOVER MODE (`python postnow_status_post.py --discover`)
-#
-#  Runs once, in the workflow's 'discover-accounts' job — merged in from
-#  the old standalone discover_accounts.py so there's only ONE script in
-#  the repo. Reads the Credentials tab, drops empty/banned/suspended rows,
-#  applies the optional MAX_ACCOUNTS_PER_RUN cap (or FORCE_ACCOUNT_ROW
-#  override), and writes a plain comma-separated row list + count to
-#  $GITHUB_OUTPUT so the 'post' job can fan out one job per eligible
-#  account row.
-#
-#  IMPORTANT: we write a plain CSV string ("1,2,3,4"), NOT a JSON-shaped
-#  string ("{\"account_row\": [1, 2, 3, 4]}"). GitHub Actions runs an
-#  automatic secret-scanner on every step output and will silently blank
-#  the ENTIRE output ("Skip output 'matrix' since it may contain secret")
-#  if the text happens to overlap a registered secret value — which can
-#  trigger by pure coincidence on a JSON string full of braces/quotes/
-#  digits. The workflow yaml rebuilds the JSON array from this CSV string
-#  via fromJson(format('[{0}]', ...)) instead.
+#  DISCOVER MODE
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_discover():
-    service = get_sheets_service()
-    values  = service.spreadsheets().values().get(
-        spreadsheetId=MASTER_SHEET_ID, range=CREDS_RANGE
-    ).execute().get("values", [])
+    ensure_required_tabs()
 
-    if len(values) < 2:
-        print(f"::error::'{CREDS_TAB}' has no data rows — add at least one account.")
+    core = load_core_data(force=True)
+    creds_values = core["creds"]
+    if not creds_values:
+        print(f"::error::'{CREDS_TAB}' tab not found or empty in the spreadsheet.")
         sys.exit(1)
-
-    header = [h.strip().upper() for h in values[0]]
+    header = hmap(creds_values)
 
     def hidx(*names):
         for n in names:
-            if n in header:
-                return header.index(n)
+            if n.upper() in header:
+                return header[n.upper()]
         return None
 
-    handle_idx = hidx("BSKY_HANDLE")
-    status_idx = hidx("ACCOUNT_STATUS")
+    handle_col = hidx("BSKY_HANDLE")
+    status_col = hidx("ACCOUNT_STATUS")
 
-    if handle_idx is None:
+    if handle_col is None:
         print(f"::error::'{CREDS_TAB}' needs a 'BSKY_HANDLE' column.")
         sys.exit(1)
 
@@ -1530,28 +1684,24 @@ def run_discover():
               f"(eligibility filter and MAX_ACCOUNTS_PER_RUN cap skipped).")
     else:
         eligible = []
-        for i, row in enumerate(values[1:], start=1):
-            handle = row[handle_idx].strip() if len(row) > handle_idx else ""
+        for excel_row in range(2, len(creds_values) + 1):
+            handle = cell(creds_values, excel_row, handle_col)
             if not handle:
                 continue
-            status = (row[status_idx].strip().lower()
-                      if status_idx is not None and len(row) > status_idx else "")
+            status = cell(creds_values, excel_row, status_col).lower() if status_col else ""
             if any(marker in status for marker in SKIP_STATUS_MARKERS):
-                print(f"Skipping row {i} ({handle}) — status: {status!r}")
+                print(f"Skipping row {excel_row - 1} ({handle}) — status: {status!r}")
                 continue
-            eligible.append(i)
+            eligible.append(excel_row - 1)
 
         if not eligible:
             print(f"::error::No eligible account rows in '{CREDS_TAB}' "
                   f"(all rows are empty or flagged banned/suspended).")
             sys.exit(1)
 
-        # Cap: workflow_dispatch input takes priority; otherwise fall back
-        # to the Settings tab's MAX_ACCOUNTS_PER_RUN; blank/unset -> run all.
         limit_raw = get_env("MAX_ACCOUNTS_PER_RUN", required=False)
         if not limit_raw:
-            settings = load_global_settings()
-            limit_raw = settings.get("MAX_ACCOUNTS_PER_RUN", "")
+            limit_raw = core["settings"].get("MAX_ACCOUNTS_PER_RUN", "")
 
         if limit_raw:
             try:
@@ -1578,8 +1728,7 @@ def run_discover():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MAIN CYCLE — one account row, one post per cycle, picked as
-#  image / video / previewLink by the ratio settings.
+#  MAIN CYCLE
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_once():
@@ -1602,7 +1751,7 @@ def run_once():
             raise AccountTakenDownError(f"Account {handle} taken down/suspended.") from exc
         if "AuthenticationRequired" in err or "Invalid identifier or password" in err:
             raise AccountTakenDownError(
-                f"Auth failed for {handle} — check BSKY_HANDLE / BSKY_APP_PW in sheet row {ACCOUNT_ROW}."
+                f"Auth failed for {handle} — check BSKY_HANDLE / BSKY_APP_PW in Credentials row {ACCOUNT_ROW}."
             ) from exc
         raise
 
@@ -1616,13 +1765,12 @@ def run_once():
 
     # ── previewLink path ────────────────────────────────────────────────
     if preferred == "previewLink":
-        sheets_service = get_sheets_service()
-        entry = pick_next_url(sheets_service)
+        entry = pick_next_url()
         if entry is None:
             print("No unposted rows left in LinkPlan — falling back to image/video this cycle.")
             preferred = random.choice(["image", "video"])
         else:
-            if not claim_url_row(sheets_service, entry):
+            if not claim_url_row(entry):
                 print("Lost claim race on this LinkPlan row; will try again next cycle.")
                 return
 
@@ -1635,16 +1783,16 @@ def run_once():
                 )
             except Exception as exc:
                 err = str(exc)
-                release_url_claim(sheets_service, entry)
+                release_url_claim(entry)
                 if "AccountTakedown" in err or "AccountSuspended" in err:
                     raise AccountTakenDownError(f"Account {handle} taken down mid-cycle.") from exc
                 print(f"previewLink post failed for {entry['url']} — claim released: {exc}")
                 raise
 
-            mark_url_posted(sheets_service, entry)
-            return  # cycle complete
+            mark_url_posted(entry)
+            return
 
-    # ── image/video path (existing Mega-backed flow) ────────────────────
+    # ── image/video path ────────────────────────────────────────────────
     plan = load_post_plan()
     if not plan:
         raise NoMediaFoundError("Post-plan sheet has no usable rows.")
@@ -1666,7 +1814,7 @@ def run_once():
         if kind == "image":
             path = compress_image_under_limit(path)
 
-        cfg = _cfg()  # re-fetch in case the sheet changed between fetch and post
+        cfg = _cfg()
         hashtags_on = cfg["hashtags_enabled_image"] if kind == "image" else cfg["hashtags_enabled_video"]
         tags = get_account_hashtags() if hashtags_on else []
         add_link = should_add_link(kind)
@@ -1693,7 +1841,16 @@ def run_once():
 
 def main():
     global ACCOUNT_ROW
+
+    if START_JITTER_MAX_SECONDS > 0:
+        delay = random.uniform(0, START_JITTER_MAX_SECONDS)
+        print(f"Startup jitter: sleeping {delay:.1f}s to spread out Sheets API bursts "
+              f"across parallel account jobs…")
+        time.sleep(delay)
+
     try:
+        ensure_required_tabs()
+        ensure_settings_defaults()
         ACCOUNT_ROW = resolve_account_row()
         load_account_config()
     except Exception as exc:
@@ -1702,8 +1859,8 @@ def main():
 
     print_config_summary()
     print(f"Starting loop. Loop interval and post-type mix are read from the "
-          f"Settings tab and re-checked at the start of every cycle — edit "
-          f"them in Google Sheets any time, no redeploy needed.")
+          f"Settings tab of the Google Sheet and re-checked at the start of "
+          f"every cycle — edit them there any time, no redeploy needed.")
 
     while True:
         cycle_start = time.time()
@@ -1724,22 +1881,25 @@ def main():
             print(f"\n{'='*60}\n{err_str}\n→ {reason}\n{'='*60}\n")
             _write_account_status(reason)
             log_account_problem(handle, status=reason)
-            # Marker file for local/manual debugging. NOTE: this account is
-            # excluded from FUTURE runs via ACCOUNT_STATUS in the sheet
-            # (run_discover() skips banned/suspended/auth-failed rows) —
-            # the workflow no longer disables itself on a single account's
-            # failure, since one workflow run now serves many accounts.
             with open("ACCOUNT_BANNED", "w") as f:
                 f.write(f"{handle}: {reason}\n")
             sys.exit(1)
         except Exception as exc:
+            # Includes exhausted-quota-retry-budget errors from sheets_call().
+            # We deliberately do NOT exit here — the whole point of the retry
+            # budget + this catch-all is that a bad cycle (quota, transient
+            # network blip, whatever) costs you one cycle, not the account.
             print(f"Error during cycle: {exc}")
 
         loop_interval = (_account_config or {}).get("loop_interval_seconds", DEFAULT_LOOP_INTERVAL_SECONDS)
+        # Small extra jitter on top of the configured interval so many
+        # parallel account jobs don't all re-hit the Sheets API in the same
+        # second forever, even if they all started in sync.
+        loop_interval = loop_interval + random.uniform(0, min(30, loop_interval * 0.05))
         elapsed   = time.time() - cycle_start
         sleep_for = max(0, loop_interval - elapsed)
         print(f"Cycle done in {elapsed:.1f}s. Sleeping {sleep_for:.1f}s "
-              f"(interval={loop_interval}s from Settings tab)…")
+              f"(interval={loop_interval:.0f}s from Settings tab, plus jitter)…")
         time.sleep(sleep_for)
 
 
