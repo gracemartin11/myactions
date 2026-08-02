@@ -87,13 +87,14 @@ jobs:
     timeout-minutes: 355
     strategy:
       fail-fast: false          # one account failing shouldn't cancel the rest
-      # THROTTLE: only this many account jobs hit the Sheets API at once.
-      # With 10+ accounts firing every cycle, running them all fully in
-      # parallel is exactly what blows through the per-minute quota. 4 is a
-      # safe default — raise it if your Google Cloud project's Sheets API
-      # quota (Google Cloud Console → APIs & Services → Sheets API → Quotas)
-      # is higher, lower it if you're still seeing 429s.
-      max-parallel: 4
+      # NOTE: do NOT set max-parallel here. Each job holds its matrix slot
+      # for the whole run (up to timeout-minutes below) because
+      # postnow_status_post.py posts in an internal loop, not once-and-exit.
+      # A max-parallel cap doesn't throttle *request rate* here — it just
+      # permanently starves accounts past the cap of ever getting a slot in
+      # this 6h window. Quota protection instead comes from batched Sheets
+      # calls + START_JITTER_MAX_SECONDS + the retry/backoff in
+      # sheets_call() below — all accounts run fully in parallel.
       matrix:
         # 'rows' is a plain comma-separated string like "1,2,3,4" (see the
         # NOTE in postnow_status_post.py's run_discover() for why this
@@ -140,8 +141,12 @@ jobs:
           SHEETS_MAX_BACKOFF_SECONDS: "60"
           # Random delay (0..N seconds) each job sleeps before its very
           # first Sheets call, so a big matrix doesn't fire in the same
-          # instant. Increase if you still see bursts of 429s at start-up.
-          START_JITTER_MAX_SECONDS: "45"
+          # instant. With all accounts now running fully in parallel (no
+          # max-parallel cap), this is the main quota-smoothing lever —
+          # widen it (e.g. 120-300) if you're running many accounts and
+          # still see 429s at start-up; each account still posts on
+          # schedule since this only delays its very first cycle.
+          START_JITTER_MAX_SECONDS: "120"
           # Small pause between consecutive Sheets calls within one job.
           SHEETS_CALL_PACING_SECONDS: "0.3"
 
