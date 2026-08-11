@@ -519,22 +519,45 @@ REQUIRED_TABS = {
 
 def ensure_required_tabs():
     """One-time (per job start) check that Credentials/Settings/Report/
-    Proxies tabs and their headers exist. Uses at most 1 read + 1
-    batchUpdate (structure) + 1 batchUpdate (headers) — never repeated
-    mid-loop."""
+    Proxies tabs and their headers exist.
+
+    Matching against existing tab titles is done case-/whitespace-
+    insensitively, because Google Sheets itself treats names like
+    "Proxies" and "Proxies " (or different casing) as colliding when you
+    try to create one — so an exact-match check can miss a tab that's
+    really already there and then blow up trying to "create" it.
+
+    Tabs are created one at a time (not as a single multi-request
+    batchUpdate) and any "already exists" error is treated as a harmless
+    no-op rather than a crash, since Sheets batchUpdate requests are
+    all-or-nothing: one bad addSheet in a combined call would otherwise
+    block every other tab in the same call from being created too."""
     existing = sheets_existing_titles()
-    add_requests, header_writes = [], []
+    existing_norm = {str(t).strip().lower() for t in existing}
+
+    header_writes = []
     for tab, header in REQUIRED_TABS.items():
-        if tab not in existing:
-            add_requests.append({"addSheet": {"properties": {"title": tab}}})
-            header_writes.append({"range": qrange(tab, "A1"), "values": [header]})
-    if add_requests:
-        sheets_call(
-            lambda: _sheets.batchUpdate(
-                spreadsheetId=GOOGLE_SHEET_ID, body={"requests": add_requests}
+        if tab.strip().lower() in existing_norm:
+            continue
+        try:
+            sheets_call(
+                lambda t=tab: _sheets.batchUpdate(
+                    spreadsheetId=GOOGLE_SHEET_ID,
+                    body={"requests": [{"addSheet": {"properties": {"title": t}}}]},
+                )
             )
-        )
-        print(f"Created missing tab(s): {[r['addSheet']['properties']['title'] for r in add_requests]}")
+            header_writes.append({"range": qrange(tab, "A1"), "values": [header]})
+            print(f"Created missing tab: {tab}")
+        except HttpError as exc:
+            body = ""
+            try:
+                body = exc.content.decode("utf-8", "ignore") if isinstance(exc.content, bytes) else str(exc.content)
+            except Exception:
+                body = str(exc)
+            if "already exists" in body:
+                print(f"Note: tab '{tab}' already exists (under a slightly different name/case) — skipping creation.")
+            else:
+                raise
     if header_writes:
         sheets_batch_update_values(header_writes)
 
