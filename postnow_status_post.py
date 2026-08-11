@@ -62,6 +62,28 @@ around minimizing call *count*, not just being polite about it:
      catches it, logs it, and sleeps until the next cycle. The account
      keeps trying every loop_interval instead of the job exiting.
 
+PROXY SUPPORT (per-account, sheet-managed)
+────────────────────────────────────────────────────
+Each Credentials row can be given its own outbound HTTP(S) proxy, pulled
+from a "Proxies" tab in the same spreadsheet. Design:
+
+  - The Proxies tab is a pool of candidate proxies (IP / Port / optional
+    ResponseTime(s) / Status), plus tracking columns this script manages:
+    ASSIGNED_TO, ASSIGNED_AT, LAST_CHECKED, LAST_CHECK_OK.
+  - An account keeps the SAME proxy across cycles once assigned (persisted
+    in Credentials via PROXY_IP / PROXY_PORT / PROXY_ASSIGNED_AT) — it does
+    NOT reshuffle every cycle.
+  - Every cycle, before login, the currently-assigned proxy (if any) is
+    re-checked for liveness. If it's dead, it's marked "dead" in the
+    Proxies tab (so nobody else picks it) and released from the account;
+    a new, not-yet-used proxy is then claimed.
+  - Claiming a fresh proxy is optimistic-locked the same way LinkPlan rows
+    are (re-read the Status cell right before writing "assigned" to narrow
+    the race between two account jobs grabbing the same proxy).
+  - A dead proxy is marked "dead" and never handed out again; a proxy that
+    was released back to the pool (e.g. its account got banned) goes back
+    to "" (free) so it can be reused elsewhere.
+
 CALL-SITE CONVENTION FOR sheets_call()
 ────────────────────────────────────────
 `sheets_call()` takes a zero-argument callable (`request_factory`) and
@@ -171,6 +193,7 @@ RCLONE_REMOTE_NAME = get_env("RCLONE_REMOTE_NAME", required=False) or "mega"
 CREDS_TAB    = "Credentials"
 SETTINGS_TAB = "Settings"
 REPORT_TAB   = "Report"
+PROXIES_TAB  = "Proxies"
 
 SKIP_STATUS_MARKERS = ("banned", "suspended", "taken down", "auth failed")
 
@@ -183,7 +206,17 @@ CREDENTIALS_HEADER = [
     "LOCKED_BY", "LOCKED_AT",
     "ACCOUNT_STATUS", "ACCOUNT_STATUS_AT",
     "ASSIGNED_REPO", "ASSIGNED_STATUS", "ASSIGNED_AT",
+    "PROXY_IP", "PROXY_PORT", "PROXY_ASSIGNED_AT",
 ]
+
+# Base columns for a brand-new Proxies tab (only used if the tab doesn't
+# exist yet at all). If you already created the tab yourself (as in this
+# setup), ensure_extra_columns() below will just append the tracking
+# columns it needs onto the end of your existing header — it never
+# touches your existing IP/Port/ResponseTime/Status data.
+PROXIES_BASE_HEADER = ["IP", "Port", "ResponseTime(s)", "Status"]
+# Tracking columns this script owns and manages automatically.
+PROXY_TRACKING_COLUMNS = ["ASSIGNED_TO", "ASSIGNED_AT", "LAST_CHECKED", "LAST_CHECK_OK"]
 
 DEFAULT_SETTINGS = [
     ("IMAGE_RATIO", "0.60"),
@@ -208,6 +241,9 @@ DEFAULT_SETTINGS = [
     ("LINK_PLAN_SHEET_NAME", "LinkPlan"),
     ("LOOP_INTERVAL_SECONDS", "1800"),
     ("MAX_ACCOUNTS_PER_RUN", ""),
+    ("USE_PROXY", "true"),
+    ("PROXY_REQUIRED", "true"),
+    ("PROXY_CHECK_TIMEOUT_SECONDS", "10"),
 ]
 
 POSTED_STATUS_VALUE = "posted"
@@ -230,6 +266,9 @@ LINK_PREVIEW_MAX_RETRIES = 3
 LINK_PREVIEW_RETRY_DELAY = 2
 
 DEFAULT_LOOP_INTERVAL_SECONDS = 1800
+
+# Used to test whether a proxy is actually usable for talking to Bluesky.
+PROXY_CHECK_URL = "https://bsky.social/xrpc/com.atproto.server.describeServer"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -474,13 +513,15 @@ REQUIRED_TABS = {
     CREDS_TAB:    CREDENTIALS_HEADER,
     SETTINGS_TAB: ["KEY", "VALUE"],
     REPORT_TAB:   REPORT_HEADER,
+    PROXIES_TAB:  PROXIES_BASE_HEADER,
 }
 
 
 def ensure_required_tabs():
-    """One-time (per job start) check that Credentials/Settings/Report tabs
-    and their headers exist. Uses at most 1 read + 1 batchUpdate (structure)
-    + 1 batchUpdate (headers) — never repeated mid-loop."""
+    """One-time (per job start) check that Credentials/Settings/Report/
+    Proxies tabs and their headers exist. Uses at most 1 read + 1
+    batchUpdate (structure) + 1 batchUpdate (headers) — never repeated
+    mid-loop."""
     existing = sheets_existing_titles()
     add_requests, header_writes = [], []
     for tab, header in REQUIRED_TABS.items():
@@ -496,6 +537,26 @@ def ensure_required_tabs():
         print(f"Created missing tab(s): {[r['addSheet']['properties']['title'] for r in add_requests]}")
     if header_writes:
         sheets_batch_update_values(header_writes)
+
+
+def ensure_extra_columns(tab, required_headers):
+    """Append any of `required_headers` that are missing from `tab`'s
+    header row, as new trailing columns. Never touches or reorders any
+    existing columns/data — safe to call on a tab you already populated
+    yourself (e.g. a Proxies tab you built with IP/Port/ResponseTime(s)/
+    Status already in it)."""
+    res = sheets_get(qrange(tab, "1:1"))
+    rows = res.get("values", [])
+    existing_header = rows[0] if rows else []
+    existing_upper = {str(h).strip().upper() for h in existing_header if str(h).strip()}
+
+    missing = [h for h in required_headers if h.upper() not in existing_upper]
+    if not missing:
+        return
+
+    start_col = len(existing_header) + 1
+    sheets_update(qrange(tab, f"{col_letter(start_col)}1"), [missing])
+    print(f"Added missing column(s) to '{tab}': {missing}")
 
 
 def ensure_settings_defaults():
@@ -688,6 +749,14 @@ def load_account_config(force_refresh=False):
         "locked_at": col("LOCKED_AT"),
         "account_status": col("ACCOUNT_STATUS"),
         "has_lock_columns": ("LOCKED_BY" in header and "LOCKED_AT" in header),
+
+        # ── Proxy config (per-account persisted assignment + global knobs) ──
+        "use_proxy":            _parse_bool(setting("USE_PROXY"), True),
+        "proxy_required":       _parse_bool(setting("PROXY_REQUIRED"), True),
+        "proxy_check_timeout":  _parse_int(setting("PROXY_CHECK_TIMEOUT_SECONDS"), 10),
+        "proxy_ip":             col("PROXY_IP"),
+        "proxy_port":           col("PROXY_PORT"),
+        "proxy_assigned_at":    col("PROXY_ASSIGNED_AT"),
     }
 
     if not cfg["handle"]:
@@ -853,6 +922,293 @@ def _write_account_status(status):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  PROXIES (per-account assignment, persisted; live-checked every cycle)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class NoProxyAvailableError(Exception):
+    """No live, unused proxy could be found this cycle (and PROXY_REQUIRED
+    is true), or the previously-assigned proxy died and nothing else was
+    available to replace it with."""
+
+
+def _http_proxy_url(ip, port):
+    return f"http://{ip}:{port}"
+
+
+def check_proxy_alive(ip, port, timeout=10):
+    """A proxy counts as 'alive' if it can actually reach Bluesky's PDS
+    through it (not just any TCP connect) — that's the only thing that
+    matters for this workflow."""
+    proxy_url = _http_proxy_url(ip, port)
+    try:
+        resp = requests.get(
+            PROXY_CHECK_URL,
+            proxies={"http": proxy_url, "https": proxy_url},
+            timeout=timeout,
+        )
+        return resp.status_code < 500
+    except Exception:
+        return False
+
+
+def _load_proxies_values():
+    res = sheets_get(qrange(PROXIES_TAB, "A:ZZ"))
+    return res.get("values", [])
+
+
+def _proxy_cols(values):
+    header = hmap(values)
+    def ci(*names):
+        for n in names:
+            if n.upper() in header:
+                return header[n.upper()]
+        return None
+    return {
+        "ip":           ci("IP"),
+        "port":         ci("PORT"),
+        "status":       ci("STATUS"),
+        "rt":           ci("RESPONSETIME(S)", "RESPONSE TIME(S)", "RESPONSETIME"),
+        "assigned_to":  ci("ASSIGNED_TO"),
+        "assigned_at":  ci("ASSIGNED_AT"),
+        "last_checked": ci("LAST_CHECKED"),
+        "last_ok":      ci("LAST_CHECK_OK"),
+    }
+
+
+def _write_proxy_row(excel_row, cols, updates):
+    """updates: dict of {col-key -> value}; unspecified keys are left
+    untouched. Always goes out as ONE batchUpdate call regardless of how
+    many of the cells changed."""
+    data = []
+    for key, val in updates.items():
+        col = cols.get(key)
+        if col is None:
+            continue
+        data.append({"range": qrange(PROXIES_TAB, f"{col_letter(col)}{excel_row}"), "values": [[val]]})
+    if data:
+        sheets_batch_update_values(data)
+
+
+def _find_proxy_row(ip, port):
+    values = _load_proxies_values()
+    cols = _proxy_cols(values)
+    if cols["ip"] is None:
+        return None, None
+    for excel_row in range(2, len(values) + 1):
+        if cell(values, excel_row, cols["ip"]) == ip and cell(values, excel_row, cols["port"]) == port:
+            return excel_row, cols
+    return None, None
+
+
+def touch_proxy_alive(ip, port):
+    """Update LAST_CHECKED/LAST_CHECK_OK for an already-assigned proxy
+    that just passed its liveness check, without touching its assignment."""
+    excel_row, cols = _find_proxy_row(ip, port)
+    if excel_row is None:
+        return
+    _write_proxy_row(excel_row, cols, {"last_checked": _now_str(), "last_ok": "alive"})
+
+
+def release_or_kill_proxy(ip, port, alive):
+    """alive=False: mark the proxy 'dead' so it's never handed out again.
+    alive=True: release it back to the free pool (e.g. its account got
+    banned and no longer needs it) so another account can claim it."""
+    excel_row, cols = _find_proxy_row(ip, port)
+    if excel_row is None:
+        return
+    now = _now_str()
+    if alive:
+        _write_proxy_row(excel_row, cols, {
+            "status": "", "assigned_to": "", "assigned_at": "",
+            "last_checked": now, "last_ok": "alive",
+        })
+    else:
+        _write_proxy_row(excel_row, cols, {
+            "status": "dead", "last_checked": now, "last_ok": "dead",
+        })
+
+
+def _claim_proxy_row(cols, excel_row, handle):
+    """Optimistic claim: re-read just the Status cell fresh right before
+    writing, to narrow (not fully eliminate) the race between two account
+    jobs claiming the same proxy row at once — same pattern as
+    claim_url_row() for LinkPlan rows elsewhere in this file."""
+    if cols["status"] is None:
+        return True
+    rng = qrange(PROXIES_TAB, f"{col_letter(cols['status'])}{excel_row}")
+    fresh = sheets_get(rng)
+    rows = fresh.get("values", [])
+    current = str(rows[0][0]).strip().lower() if rows and rows[0] else ""
+    if current in ("assigned", "dead"):
+        return False
+
+    now = _now_str()
+    _write_proxy_row(excel_row, cols, {
+        "status": "assigned", "assigned_to": handle, "assigned_at": now,
+        "last_checked": now, "last_ok": "alive",
+    })
+    return True
+
+
+def find_and_claim_free_proxy(handle, timeout):
+    """Scan the Proxies tab for a free (not assigned, not dead) proxy,
+    fastest ResponseTime(s) first, live-check each candidate, and claim
+    the first one that's actually alive. Dead candidates encountered along
+    the way are marked 'dead' so future cycles skip them immediately."""
+    values = _load_proxies_values()
+    if not values or len(values) < 2:
+        return None
+    cols = _proxy_cols(values)
+    if cols["ip"] is None or cols["port"] is None:
+        print(f"Warning: '{PROXIES_TAB}' needs at least IP and Port columns.")
+        return None
+
+    candidates = []
+    for excel_row in range(2, len(values) + 1):
+        ip = cell(values, excel_row, cols["ip"])
+        port = cell(values, excel_row, cols["port"])
+        if not ip or not port:
+            continue
+        status = cell(values, excel_row, cols["status"]).lower() if cols["status"] else ""
+        if status in ("assigned", "dead"):
+            continue
+        rt = 999.0
+        if cols["rt"]:
+            raw_rt = cell(values, excel_row, cols["rt"])
+            try:
+                rt = float(raw_rt) if raw_rt else 999.0
+            except ValueError:
+                rt = 999.0
+        candidates.append((rt, excel_row, ip, port))
+
+    candidates.sort(key=lambda t: t[0])
+
+    for _, excel_row, ip, port in candidates:
+        if check_proxy_alive(ip, port, timeout):
+            if _claim_proxy_row(cols, excel_row, handle):
+                print(f"Claimed proxy {ip}:{port} for {handle}.")
+                return ip, port
+            print(f"Lost claim race on proxy {ip}:{port} — trying next candidate.")
+            continue
+        _write_proxy_row(excel_row, cols, {"status": "dead", "last_checked": _now_str(), "last_ok": "dead"})
+        print(f"Proxy {ip}:{port} failed liveness check — marked dead, trying next candidate.")
+
+    return None
+
+
+def _write_account_proxy(ip, port):
+    global _account_config
+    core = load_core_data(force=True)
+    header = hmap(core["creds"])
+    ip_col   = header.get("PROXY_IP")
+    port_col = header.get("PROXY_PORT")
+    at_col   = header.get("PROXY_ASSIGNED_AT")
+    if ip_col is None or port_col is None:
+        print(f"Warning: '{CREDS_TAB}' needs PROXY_IP and PROXY_PORT columns to "
+              f"persist the proxy assignment across cycles.")
+        return
+    excel_row = ACCOUNT_ROW + 1
+    data = [
+        {"range": qrange(CREDS_TAB, f"{col_letter(ip_col)}{excel_row}"), "values": [[ip]]},
+        {"range": qrange(CREDS_TAB, f"{col_letter(port_col)}{excel_row}"), "values": [[port]]},
+    ]
+    if at_col is not None:
+        data.append({"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"), "values": [[_now_str()]]})
+    sheets_batch_update_values(data)
+    if _account_config:
+        _account_config["proxy_ip"] = ip
+        _account_config["proxy_port"] = port
+
+
+def _clear_account_proxy():
+    global _account_config
+    core = load_core_data(force=True)
+    header = hmap(core["creds"])
+    ip_col   = header.get("PROXY_IP")
+    port_col = header.get("PROXY_PORT")
+    if ip_col is None or port_col is None:
+        return
+    excel_row = ACCOUNT_ROW + 1
+    sheets_batch_update_values([
+        {"range": qrange(CREDS_TAB, f"{col_letter(ip_col)}{excel_row}"), "values": [[""]]},
+        {"range": qrange(CREDS_TAB, f"{col_letter(port_col)}{excel_row}"), "values": [[""]]},
+    ])
+    if _account_config:
+        _account_config["proxy_ip"] = ""
+        _account_config["proxy_port"] = ""
+
+
+def ensure_account_proxy(cfg):
+    """Called once per cycle, right before login. Keeps the account on its
+    previously-assigned proxy as long as it's alive; otherwise kills it and
+    claims a fresh, not-yet-used one. Returns an 'http://ip:port' proxy URL,
+    or None if proxies are disabled (USE_PROXY=false)."""
+    if not cfg.get("use_proxy", True):
+        return None
+
+    handle  = cfg["handle"]
+    timeout = cfg.get("proxy_check_timeout", 10)
+
+    ip, port = cfg.get("proxy_ip", ""), cfg.get("proxy_port", "")
+    if ip and port:
+        if check_proxy_alive(ip, port, timeout):
+            touch_proxy_alive(ip, port)
+            print(f"Reusing existing proxy {ip}:{port} for {handle} (still alive).")
+            return _http_proxy_url(ip, port)
+        print(f"Assigned proxy {ip}:{port} for {handle} is dead — releasing it and picking a new one.")
+        release_or_kill_proxy(ip, port, alive=False)
+        _clear_account_proxy()
+
+    claimed = find_and_claim_free_proxy(handle, timeout)
+    if claimed is None:
+        if cfg.get("proxy_required", True):
+            raise NoProxyAvailableError(
+                f"No live, unused proxy available in '{PROXIES_TAB}' for {handle}."
+            )
+        print("No proxy available and PROXY_REQUIRED is false — continuing without a proxy.")
+        return None
+
+    ip, port = claimed
+    _write_account_proxy(ip, port)
+    return _http_proxy_url(ip, port)
+
+
+def build_bsky_client(proxy_url):
+    """Create the atproto Client, routed through `proxy_url` if given.
+    Tries the newer httpx-style `proxy=` kwarg first, falls back to the
+    older `proxies=` kwarg for older httpx/atproto versions, and finally
+    just logs in without a proxy rather than crashing the cycle."""
+    if not proxy_url:
+        return Client()
+    for kwargs in (
+        {"proxy": proxy_url},
+        {"proxies": proxy_url},
+        {"proxies": {"http://": proxy_url, "https://": proxy_url}},
+    ):
+        try:
+            return Client(**kwargs)
+        except TypeError:
+            continue
+    print("Warning: could not configure an HTTP proxy on the atproto Client "
+          "(unsupported by the installed httpx/atproto version) — continuing without a proxy.")
+    return Client()
+
+
+def _looks_like_proxy_error(exc):
+    """Heuristic: does this exception look like it came from the proxy
+    itself being unreachable/broken, rather than a real Bluesky API error
+    (bad credentials, account takedown, etc.)?"""
+    text = f"{type(exc).__name__}: {exc}"
+    markers = (
+        "ProxyError", "ConnectError", "ConnectTimeout", "ReadTimeout",
+        "Failed to establish a new connection", "Connection refused",
+        "Cannot connect to proxy", "Tunnel connection failed",
+        "Max retries exceeded", "RemoteProtocolError", "ConnectionResetError",
+    )
+    return any(m in text for m in markers)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  TEXT HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -906,6 +1262,12 @@ def print_config_summary():
               f"last heartbeat={cfg.get('locked_at') or '—'})")
     else:
         print("  Cross-repo lock:          disabled (add LOCKED_BY / LOCKED_AT columns to enable)")
+    print(f"  Proxy usage:              {'enabled' if cfg.get('use_proxy', True) else 'disabled'}"
+          f"{' (required)' if cfg.get('use_proxy', True) and cfg.get('proxy_required', True) else ''}")
+    if cfg.get("use_proxy", True):
+        proxy_display = f"{cfg.get('proxy_ip') or '—'}:{cfg.get('proxy_port') or '—'}"
+        print(f"  Current proxy:            {proxy_display}")
+        print(f"  Proxy check timeout:      {cfg.get('proxy_check_timeout', 10)}s")
     print(f"  Sheets retry budget:      {SHEETS_RETRY_BUDGET_SECONDS}s per call "
           f"(max backoff {SHEETS_MAX_BACKOFF_SECONDS}s)")
     print("─────────────────────────────────────────────────")
@@ -1828,12 +2190,24 @@ def run_once():
 
     handle = cfg["handle"]
 
+    # Get (or keep) a live proxy for this account before doing anything else.
+    proxy_url = ensure_account_proxy(cfg)
+    cfg = _cfg()   # pick up any proxy_ip/proxy_port just written to the cache
+
     print_target_account(handle)
-    client = Client()
+    client = build_bsky_client(proxy_url)
     try:
         client.login(handle, cfg["app_pw"])
     except Exception as exc:
         err = str(exc)
+        if proxy_url and _looks_like_proxy_error(exc):
+            ip, port = cfg.get("proxy_ip", ""), cfg.get("proxy_port", "")
+            if ip and port:
+                release_or_kill_proxy(ip, port, alive=False)
+                _clear_account_proxy()
+            print(f"Login failed through proxy {proxy_url} — marked dead; "
+                  f"a new proxy will be picked next cycle: {exc}")
+            raise
         if "AccountTakedown" in err or "AccountSuspended" in err:
             raise AccountTakenDownError(f"Account {handle} taken down/suspended.") from exc
         if "AuthenticationRequired" in err or "Invalid identifier or password" in err:
@@ -1937,6 +2311,8 @@ def main():
 
     try:
         ensure_required_tabs()
+        ensure_extra_columns(CREDS_TAB, ["PROXY_IP", "PROXY_PORT", "PROXY_ASSIGNED_AT"])
+        ensure_extra_columns(PROXIES_TAB, PROXY_TRACKING_COLUMNS)
         ensure_settings_defaults()
         ACCOUNT_ROW = resolve_account_row()
         load_account_config()
@@ -1956,6 +2332,9 @@ def main():
         except AccountLockedElsewhereError as exc:
             print(f"\n{'='*60}\n{exc}\nSkipping — schedule keeps running.\n{'='*60}\n")
             sys.exit(0)
+        except NoProxyAvailableError as exc:
+            print(f"\n{'='*60}\n{exc}\nSkipping this cycle — schedule keeps running.\n{'='*60}\n")
+            sys.exit(0)
         except NoMediaFoundError as exc:
             print(f"\n{'='*60}\nNO MEDIA: {exc}\nStopping — schedule keeps running.\n{'='*60}\n")
             sys.exit(0)
@@ -1968,6 +2347,11 @@ def main():
             print(f"\n{'='*60}\n{err_str}\n→ {reason}\n{'='*60}\n")
             _write_account_status(reason)
             log_account_problem(handle, status=reason)
+            # This account is done for good — free up its proxy for others.
+            ip, port = (_account_config or {}).get("proxy_ip", ""), (_account_config or {}).get("proxy_port", "")
+            if ip and port:
+                release_or_kill_proxy(ip, port, alive=True)
+                _clear_account_proxy()
             with open("ACCOUNT_BANNED", "w") as f:
                 f.write(f"{handle}: {reason}\n")
             sys.exit(1)
