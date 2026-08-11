@@ -1018,20 +1018,41 @@ def _write_proxy_row(excel_row, cols, updates):
 
 
 def _find_proxy_row(ip, port):
+    """Returns (excel_row, cols, values) for the Proxies row matching
+    ip/port, or (None, None, None) if not found. Returning the already-
+    loaded `values` array lets callers read any field (e.g. ASSIGNED_TO)
+    without an extra Sheets round trip."""
     values = _load_proxies_values()
     cols = _proxy_cols(values)
     if cols["ip"] is None:
-        return None, None
+        return None, None, None
     for excel_row in range(2, len(values) + 1):
         if cell(values, excel_row, cols["ip"]) == ip and cell(values, excel_row, cols["port"]) == port:
-            return excel_row, cols
-    return None, None
+            return excel_row, cols, values
+    return None, None, None
+
+
+def _proxy_owned_by(ip, port, handle):
+    """True only if the Proxies tab currently shows THIS handle as the
+    ASSIGNED_TO owner of ip:port. Used to catch the case where an account's
+    Credentials row still has a PROXY_IP/PROXY_PORT on file that either
+    never got recorded as "assigned" (stale data from before ASSIGNED_TO
+    existed) or has since been claimed by a different account — in either
+    case this account must NOT keep reusing it, since that would mean two
+    accounts sharing one proxy."""
+    excel_row, cols, values = _find_proxy_row(ip, port)
+    if excel_row is None or cols["assigned_to"] is None:
+        return False
+    assigned_to = cell(values, excel_row, cols["assigned_to"])
+    if not assigned_to:
+        return False
+    return assigned_to.strip().lower() == handle.strip().lower()
 
 
 def touch_proxy_alive(ip, port):
     """Update LAST_CHECKED/LAST_CHECK_OK for an already-assigned proxy
     that just passed its liveness check, without touching its assignment."""
-    excel_row, cols = _find_proxy_row(ip, port)
+    excel_row, cols, _values = _find_proxy_row(ip, port)
     if excel_row is None:
         return
     _write_proxy_row(excel_row, cols, {"last_checked": _now_str(), "last_ok": "alive"})
@@ -1041,7 +1062,7 @@ def release_or_kill_proxy(ip, port, alive):
     """alive=False: mark the proxy 'dead' so it's never handed out again.
     alive=True: release it back to the free pool (e.g. its account got
     banned and no longer needs it) so another account can claim it."""
-    excel_row, cols = _find_proxy_row(ip, port)
+    excel_row, cols, _values = _find_proxy_row(ip, port)
     if excel_row is None:
         return
     now = _now_str()
@@ -1196,13 +1217,24 @@ def ensure_account_proxy(cfg):
 
     ip, port = cfg.get("proxy_ip", ""), cfg.get("proxy_port", "")
     if ip and port:
-        if check_proxy_alive(ip, port, timeout):
+        if not _proxy_owned_by(ip, port, handle):
+            # Either stale data (this account's Credentials row still
+            # points at a proxy that was never actually recorded as
+            # "assigned" to it) or the proxy has since been claimed by a
+            # different account. Either way: this account must NOT keep
+            # using it — that would mean two accounts sharing one proxy.
+            print(f"Proxy {ip}:{port} on file for {handle} is not exclusively assigned to "
+                  f"this account in '{PROXIES_TAB}' — clearing the stale record and "
+                  f"claiming a fresh, unshared proxy instead.")
+            _clear_account_proxy()
+        elif check_proxy_alive(ip, port, timeout):
             touch_proxy_alive(ip, port)
             print(f"Reusing existing proxy {ip}:{port} for {handle} (still alive).")
             return _http_proxy_url(ip, port)
-        print(f"Assigned proxy {ip}:{port} for {handle} is dead — releasing it and picking a new one.")
-        release_or_kill_proxy(ip, port, alive=False)
-        _clear_account_proxy()
+        else:
+            print(f"Assigned proxy {ip}:{port} for {handle} is dead — releasing it and picking a new one.")
+            release_or_kill_proxy(ip, port, alive=False)
+            _clear_account_proxy()
 
     claimed = find_and_claim_free_proxy(handle, timeout)
     if claimed is None:
