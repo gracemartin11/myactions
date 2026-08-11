@@ -117,6 +117,7 @@ import requests
 from bs4 import BeautifulSoup
 from atproto import Client, models
 from atproto_client.utils import TextBuilder
+from atproto_client.request import Request as AtprotoRequest
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -215,8 +216,12 @@ CREDENTIALS_HEADER = [
 # columns it needs onto the end of your existing header — it never
 # touches your existing IP/Port/ResponseTime/Status data.
 PROXIES_BASE_HEADER = ["IP", "Port", "ResponseTime(s)", "Status"]
-# Tracking columns this script owns and manages automatically.
-PROXY_TRACKING_COLUMNS = ["ASSIGNED_TO", "ASSIGNED_AT", "LAST_CHECKED", "LAST_CHECK_OK"]
+# Tracking columns this script owns and manages automatically. "Status" is
+# included here (not just in PROXIES_BASE_HEADER) so it gets re-added if
+# it's ever missing/deleted from an existing tab — without it there's no
+# single authoritative "assigned"/"dead" field, which is what let dead
+# proxies get reused instead of permanently skipped.
+PROXY_TRACKING_COLUMNS = ["Status", "ASSIGNED_TO", "ASSIGNED_AT", "LAST_CHECKED", "LAST_CHECK_OK"]
 
 DEFAULT_SETTINGS = [
     ("IMAGE_RATIO", "0.60"),
@@ -1052,18 +1057,25 @@ def release_or_kill_proxy(ip, port, alive):
 
 
 def _claim_proxy_row(cols, excel_row, handle):
-    """Optimistic claim: re-read just the Status cell fresh right before
-    writing, to narrow (not fully eliminate) the race between two account
-    jobs claiming the same proxy row at once — same pattern as
-    claim_url_row() for LinkPlan rows elsewhere in this file."""
-    if cols["status"] is None:
-        return True
-    rng = qrange(PROXIES_TAB, f"{col_letter(cols['status'])}{excel_row}")
-    fresh = sheets_get(rng)
-    rows = fresh.get("values", [])
-    current = str(rows[0][0]).strip().lower() if rows and rows[0] else ""
-    if current in ("assigned", "dead"):
-        return False
+    """Optimistic claim: re-read the Status cell (and ASSIGNED_TO, as a
+    fallback if there's no Status column) fresh right before writing, to
+    narrow (not fully eliminate) the race between two account jobs
+    claiming the same proxy row at once — same pattern as claim_url_row()
+    for LinkPlan rows elsewhere in this file."""
+    if cols["status"] is not None:
+        rng = qrange(PROXIES_TAB, f"{col_letter(cols['status'])}{excel_row}")
+        fresh = sheets_get(rng)
+        rows = fresh.get("values", [])
+        current = str(rows[0][0]).strip().lower() if rows and rows[0] else ""
+        if current in ("assigned", "dead"):
+            return False
+    elif cols["assigned_to"] is not None:
+        rng = qrange(PROXIES_TAB, f"{col_letter(cols['assigned_to'])}{excel_row}")
+        fresh = sheets_get(rng)
+        rows = fresh.get("values", [])
+        current = str(rows[0][0]).strip() if rows and rows[0] else ""
+        if current:
+            return False
 
     now = _now_str()
     _write_proxy_row(excel_row, cols, {
@@ -1093,7 +1105,17 @@ def find_and_claim_free_proxy(handle, timeout):
         if not ip or not port:
             continue
         status = cell(values, excel_row, cols["status"]).lower() if cols["status"] else ""
+        last_ok = cell(values, excel_row, cols["last_ok"]).lower() if cols["last_ok"] else ""
+        assigned_to = cell(values, excel_row, cols["assigned_to"]).strip() if cols["assigned_to"] else ""
+        # Belt-and-suspenders: honor Status if present, but ALSO skip a row
+        # if LAST_CHECK_OK says "dead" or ASSIGNED_TO is already filled in —
+        # this way a missing/deleted Status column can't cause a dead or
+        # already-claimed proxy to look free.
         if status in ("assigned", "dead"):
+            continue
+        if last_ok == "dead":
+            continue
+        if assigned_to:
             continue
         rt = 999.0
         if cols["rt"]:
@@ -1196,25 +1218,46 @@ def ensure_account_proxy(cfg):
     return _http_proxy_url(ip, port)
 
 
+class ProxyClientBuildError(Exception):
+    """Raised when a proxy was assigned/required but could not actually be
+    attached to the atproto Client. Callers must treat this as a hard stop
+    for the cycle (no login, no post) — never as a reason to fall back to
+    posting without a proxy."""
+
+
 def build_bsky_client(proxy_url):
     """Create the atproto Client, routed through `proxy_url` if given.
-    Tries the newer httpx-style `proxy=` kwarg first, falls back to the
-    older `proxies=` kwarg for older httpx/atproto versions, and finally
-    just logs in without a proxy rather than crashing the cycle."""
+
+    IMPORTANT: atproto's Client(base_url=None, *args, **kwargs) looks like
+    it forwards kwargs to httpx, but it doesn't — ClientBase.__init__ only
+    accepts (base_url, request). Passing Client(proxy=...) or
+    Client(proxies=...) directly raises TypeError (silently swallowed by a
+    naive try/except, which is how a previous version of this function
+    ended up building an UNPROXIED client and posting through it anyway).
+
+    The correct way is to build the underlying Request object yourself —
+    Request(**kwargs) forwards straight into httpx.Client(**kwargs) — and
+    hand that pre-built Request to Client(request=...).
+    """
     if not proxy_url:
         return Client()
+
+    last_exc = None
     for kwargs in (
-        {"proxy": proxy_url},
-        {"proxies": proxy_url},
-        {"proxies": {"http://": proxy_url, "https://": proxy_url}},
+        {"proxy": proxy_url},                                          # httpx >= 0.26
+        {"proxies": {"http://": proxy_url, "https://": proxy_url}},     # older httpx
     ):
         try:
-            return Client(**kwargs)
-        except TypeError:
+            req = AtprotoRequest(**kwargs)
+            return Client(request=req)
+        except TypeError as exc:
+            last_exc = exc
             continue
-    print("Warning: could not configure an HTTP proxy on the atproto Client "
-          "(unsupported by the installed httpx/atproto version) — continuing without a proxy.")
-    return Client()
+
+    raise ProxyClientBuildError(
+        f"Could not configure HTTP proxy {proxy_url!r} on the atproto Client "
+        f"with the installed httpx/atproto version ({last_exc})."
+    )
 
 
 def _looks_like_proxy_error(exc):
@@ -2218,7 +2261,14 @@ def run_once():
     cfg = _cfg()   # pick up any proxy_ip/proxy_port just written to the cache
 
     print_target_account(handle)
-    client = build_bsky_client(proxy_url)
+    try:
+        client = build_bsky_client(proxy_url)
+    except ProxyClientBuildError as exc:
+        # A proxy was required/assigned but couldn't actually be attached
+        # to the HTTP client — do NOT fall back to an unproxied client.
+        # Skip this cycle entirely; nothing gets logged in or posted.
+        raise NoProxyAvailableError(str(exc)) from exc
+
     try:
         client.login(handle, cfg["app_pw"])
     except Exception as exc:
