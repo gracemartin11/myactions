@@ -2268,17 +2268,21 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
         if caption_text:
             tb.text(caption_text)
 
-        # Action line + single link (rich OR plain — never both)
+        # Action line + single CLICKABLE link (never plain non-clickable text).
+        # Both modes use app.bsky.richtext.facet#link via TextBuilder.link():
+        #   "rich"  → custom anchor text (e.g. "Live Models") → URL
+        #   "plain" → URL text itself is the clickable link     → URL
         if link_mode in ("rich", "plain"):
             tb.text("\n\n")
             if action_line:
                 tb.text(action_line + " ")
+            url = cfg["link_url"]
             if link_mode == "rich":
                 display = (rich_display or cfg.get("link_display_text") or "Live Models").strip()
-                tb.link(display, cfg["link_url"])
+                tb.link(display, url)
             else:
-                # plain actual URL — strip scheme for cleaner look if desired; keep full URL
-                tb.text(cfg["link_url"])
+                # URL string is both the visible text and the destination — real facet link
+                tb.link(url, url)
 
         if tags:
             tb.text("\n\n")
