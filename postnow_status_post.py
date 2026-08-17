@@ -1546,6 +1546,134 @@ def get_account_hashtags():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  AUTO ADULT / LIVE-CAM CAPTIONS (unique every post, with emojis)
+# ═══════════════════════════════════════════════════════════════════════════
+# Two styles randomly mixed:
+#   - "normal": short teaser caption only
+#   - "action": action-style line that sits right before the link
+# When a link is added, either a rich-text display link ("Live Models" etc.)
+# OR the plain actual URL is used — never both on the same post.
+
+_CAPTION_EMOJIS = [
+    "🔥", "😈", "💋", "🥵", "💦", "🍑", "🍆", "❤️‍🔥", "😉", "👅",
+    "💃", "🎥", "🔴", "💕", "✨", "👀", "🥰", "😏", "💖", "🌙",
+]
+
+_NORMAL_CAPTION_TEMPLATES = [
+    "{e} Live now — come say hi {e2}",
+    "{e} Private show starting… are you free? {e2}",
+    "{e} 1-on-1 live cam — waiting for you {e2}",
+    "{e} Horny & online right now {e2}",
+    "{e} Exclusive live chat tonight {e2}",
+    "{e} Real-time private room open {e2}",
+    "{e} Come watch me live {e2}",
+    "{e} Naughty live cam is on {e2}",
+    "{e} Feeling playful… join my live {e2}",
+    "{e} Adult live stream — no limits {e2}",
+    "{e} Just went live for you {e2}",
+    "{e} Private 1-on-1 available now {e2}",
+    "{e} Live & ready to chat {e2}",
+    "{e} Online for a private show {e2}",
+    "{e} Dirty talk live — hop in {e2}",
+    "{e} Cam is on… don't miss it {e2}",
+    "{e} Live models waiting for you {e2}",
+    "{e} Spicy live chat tonight {e2}",
+    "{e} Come play with me live {e2}",
+    "{e} Adult content live right now {e2}",
+]
+
+_ACTION_CAPTION_TEMPLATES = [
+    "{e} Click to join my live cam {e2}",
+    "{e} Start private 1-on-1 chat here {e2}",
+    "{e} Enter the live room → {e2}",
+    "{e} Watch me live & chat now {e2}",
+    "{e} Join exclusive live show {e2}",
+    "{e} Open private cam session {e2}",
+    "{e} Tap for live adult chat {e2}",
+    "{e} Go live with me right now {e2}",
+    "{e} Unlock private live stream {e2}",
+    "{e} Join my 1-on-1 live cam {e2}",
+    "{e} Click for naughty live chat {e2}",
+    "{e} Enter private show room {e2}",
+    "{e} Start live cam session {e2}",
+    "{e} Watch exclusive live now {e2}",
+    "{e} Hop into my live chat {e2}",
+    "{e} Private adult live — join {e2}",
+    "{e} Live models online — enter {e2}",
+    "{e} Open live cam & chat {e2}",
+    "{e} Come inside my live room {e2}",
+    "{e} Click for real-time private show {e2}",
+]
+
+_RICH_LINK_DISPLAY_OPTIONS = [
+    "Live Models",
+    "Live Cam",
+    "1-on-1 Live",
+    "Private Show",
+    "Live Chat",
+    "Join Live",
+    "Watch Live",
+    "Private Cam",
+    "Adult Live",
+    "Live Now",
+]
+
+
+def _pick_emojis():
+    e1 = random.choice(_CAPTION_EMOJIS)
+    e2 = random.choice([x for x in _CAPTION_EMOJIS if x != e1] or _CAPTION_EMOJIS)
+    return e1, e2
+
+
+def generate_auto_caption(style="normal"):
+    """Return a unique adult/live-cam style caption with emojis.
+    style: 'normal' | 'action'
+    """
+    e1, e2 = _pick_emojis()
+    templates = _ACTION_CAPTION_TEMPLATES if style == "action" else _NORMAL_CAPTION_TEMPLATES
+    tmpl = random.choice(templates)
+    return tmpl.format(e=e1, e2=e2)
+
+
+def choose_caption_and_link_style(sheet_caption, add_link):
+    """Decide final caption text + how the link (if any) is rendered.
+
+    Returns:
+      caption_text: str  — body text (no URL embedded)
+      link_mode: None | "rich" | "plain"
+        - None: no link on this post
+        - "rich": use TextBuilder.link(display_text, url) with a display label
+        - "plain": append the actual URL as plain text (no rich facet)
+      rich_display: str or None — display text when link_mode == "rich"
+    """
+    cfg = _cfg()
+
+    # Always unique adult / live-cam auto caption (normal teaser OR action line).
+    # Sheet captions are ignored so every media post stays unique and on-theme.
+    style = random.choice(["normal", "action"])
+    caption_text = generate_auto_caption(style)
+
+    if not add_link:
+        return caption_text, None, None
+
+    # Exactly one link style per post: rich display OR plain actual URL — never both.
+    link_mode = random.choice(["rich", "plain"])
+    rich_display = None
+    if link_mode == "rich":
+        # Prefer account's LINK_DISPLAY_TEXT when set to something meaningful;
+        # otherwise pick a random live-cam style label.
+        account_display = (cfg.get("link_display_text") or "").strip()
+        bare_url = (cfg.get("link_url") or "").replace("https://", "").replace("http://", "").lower()
+        if account_display and account_display.lower() not in (bare_url, ""):
+            # Sometimes still randomize for variety; mostly use the account one.
+            rich_display = account_display if random.random() < 0.55 else random.choice(_RICH_LINK_DISPLAY_OPTIONS)
+        else:
+            rich_display = random.choice(_RICH_LINK_DISPLAY_OPTIONS)
+
+    return caption_text, link_mode, rich_display
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  LINK-IN-POST DECISION
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1974,20 +2102,24 @@ def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes, auto_ca
         print(f"Warning: preview fetch failed ({exc}); posting as plain link instead.")
 
     used_auto_caption = False
-    effective_caption = caption
-    if not effective_caption and preview and auto_caption_enabled:
-        effective_caption = compose_fallback_caption(preview)
-        used_auto_caption = bool(effective_caption)
-        if used_auto_caption:
-            print("No Caption in sheet — using title + description from the preview instead.")
-    elif not effective_caption and preview and not auto_caption_enabled:
+    effective_caption = (caption or "").strip()
+    if effective_caption:
+        effective_caption = _URL_RE.sub("", effective_caption).strip()
+    if not effective_caption and auto_caption_enabled:
+        # Prefer unique adult/live-cam auto caption; fall back to preview title+desc only if disabled.
+        effective_caption = generate_auto_caption(random.choice(["normal", "action"]))
+        used_auto_caption = True
+        print(f"No Caption in sheet — using auto adult/live-cam caption: {effective_caption!r}")
+    elif not effective_caption and not auto_caption_enabled:
         print("No Caption in sheet and previewLink auto-caption is off — posting without a caption.")
 
+    # For previewLink posts the embed already carries the destination URL, so we
+    # do not also put a rich/plain link in the text (avoids double links).
     tb = build_link_caption_text(effective_caption, tags, fallback_url=(url if preview is None else None))
     client.send_post(text=tb, embed=embed)
 
     posted_url = preview["final_url"] if preview else url
-    caption_source = "auto (title+description)" if used_auto_caption else ("sheet" if caption else "no")
+    caption_source = "auto (adult/live-cam)" if used_auto_caption else ("sheet" if caption else "no")
     print(f"✓ Posted {'link card' if embed else 'plain link'} for {posted_url} "
           f"(caption={caption_source}, tags={len(tags)})")
 
@@ -2112,31 +2244,36 @@ def release_claim(claimed_name, original_name):
 #  IMAGE/VIDEO POST BUILDING
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_post_from_caption(caption, tags, add_link):
+def build_post_from_caption(caption, tags, add_link, link_mode=None, rich_display=None):
+    """Build rich-text post body.
+
+    link_mode:
+      None   — no link
+      "rich" — TextBuilder.link(rich_display, account link_url)
+      "plain"— append the actual link_url as plain text (never both)
+    """
     cfg  = _cfg()
     text = replace_mentions(caption) if caption else ""
+    # Always strip any URLs from the body so we control the single link.
+    text = _URL_RE.sub("", text).strip() if text else ""
 
     def _assemble(caption_text):
         tb = TextBuilder()
-        if add_link:
-            m = _URL_RE.search(caption_text)
-            if m:
-                before = caption_text[:m.start()].rstrip()
-                after  = _URL_RE.sub("", caption_text[m.end():]).strip()
-                if before:
-                    tb.text(before + " ")
-                tb.link(cfg["link_display_text"], cfg["link_url"])
-                if after:
-                    tb.text(" " + after)
-            else:
-                if caption_text:
-                    tb.text(caption_text)
-                    tb.text("\n\n")
-                tb.link(cfg["link_display_text"], cfg["link_url"])
-        else:
-            text_no_url = _URL_RE.sub("", caption_text).strip()
-            if text_no_url:
-                tb.text(text_no_url)
+        if caption_text:
+            tb.text(caption_text)
+
+        if link_mode == "rich":
+            display = (rich_display or cfg.get("link_display_text") or "Live Models").strip()
+            url = cfg["link_url"]
+            if caption_text:
+                tb.text("\n\n")
+            tb.link(display, url)
+        elif link_mode == "plain":
+            url = cfg["link_url"]
+            if caption_text:
+                tb.text("\n\n")
+            tb.text(url)
+        # link_mode is None → no link at all
 
         if tags:
             tb.text("\n\n")
@@ -2169,7 +2306,11 @@ def build_post_from_caption(caption, tags, add_link):
 
 
 def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_link):
-    tb = build_post_from_caption(caption, tags, add_link)
+    caption_text, link_mode, rich_display = choose_caption_and_link_style(caption, add_link)
+    tb = build_post_from_caption(
+        caption_text, tags, add_link,
+        link_mode=link_mode, rich_display=rich_display,
+    )
     if kind == "video":
         with open(local_path, "rb") as f:
             client.send_video(text=tb, video=f.read(), video_alt=media_name)
@@ -2177,18 +2318,12 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
         with open(local_path, "rb") as f:
             client.send_image(text=tb, image=f.read(), image_alt=media_name)
 
-    preview = replace_mentions(caption or "")
-    if add_link:
-        m = _URL_RE.search(preview)
-        if m:
-            preview = (preview[:m.start()].rstrip()
-                       + f" [{_cfg()['link_display_text']}]"
-                       + _URL_RE.sub("", preview[m.end():]).strip())
-        else:
-            preview = (preview + f" [{_cfg()['link_display_text']}]").strip()
-    else:
-        preview = _URL_RE.sub("", preview).strip()
-    print(f"✓ Posted {kind}: {preview!r} (link={'yes' if add_link else 'no'})")
+    link_info = "no"
+    if link_mode == "rich":
+        link_info = f"rich[{rich_display}]"
+    elif link_mode == "plain":
+        link_info = "plain-url"
+    print(f"✓ Posted {kind}: {caption_text!r} (link={link_info})")
     if tags:
         print(f"  Tags: {' '.join('#'+t for t in tags)}")
 
